@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
 import run.endive.redline.experimental.api.internal.CtxBuffer;
+import run.endive.redline.experimental.api.internal.InterruptWatchdog;
 import run.endive.redline.experimental.api.internal.RedlineTarget;
 import run.endive.redline.experimental.api.internal.TypeMapUtils;
 import run.endive.redline.experimental.bridge.internal.CraneliftBridge;
@@ -87,6 +88,8 @@ public final class NativeMachine implements Machine {
     private MemorySegment trampolineRegion;
     private long trampolineRegionSize;
     private final MemorySegment ctxBuffer;
+    // Allocated once: the watchdog takes it on every call.
+    private final Runnable raiseInterrupt = this::requestInterrupt;
     private final MemorySegment funcTable;
     private final MemorySegment argsBuffer;
     private final MemorySegment globalsBuffer;
@@ -1083,31 +1086,12 @@ public final class NativeMachine implements Machine {
                 throw new TrapException("interrupted");
             }
 
-            Thread caller = Thread.currentThread();
-            Thread watchdog =
-                    new Thread(
-                            () -> {
-                                // Keeps raising rather than returning after the
-                                // first: a nested call clears the flag when it
-                                // finishes, and the outer call still needs it.
-                                while (!Thread.currentThread().isInterrupted()) {
-                                    if (caller.isInterrupted()) {
-                                        requestInterrupt();
-                                    }
-                                    try {
-                                        Thread.sleep(1);
-                                    } catch (InterruptedException e) {
-                                        return;
-                                    }
-                                }
-                            });
-            watchdog.setDaemon(true);
-            watchdog.start();
+            var watch = InterruptWatchdog.watch(raiseInterrupt);
             long result;
             try {
                 result = (long) handle.invokeExact(cachedMemBase, ctxBuffer, args);
             } finally {
-                watchdog.interrupt();
+                watch.close();
                 // The flag only ever means "stop this call". Left set it would
                 // trap the next one on a thread nobody interrupted.
                 clearInterrupt();

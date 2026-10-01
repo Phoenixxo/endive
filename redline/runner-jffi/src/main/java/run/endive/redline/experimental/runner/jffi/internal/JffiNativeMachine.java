@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import run.endive.redline.experimental.api.internal.CtxBuffer;
+import run.endive.redline.experimental.api.internal.InterruptWatchdog;
 import run.endive.redline.experimental.api.internal.RedlineTarget;
 import run.endive.redline.experimental.api.internal.TypeMapUtils;
 import run.endive.redline.experimental.bridge.internal.CraneliftBridge;
@@ -93,6 +94,8 @@ public final class JffiNativeMachine implements Machine {
     private long trampolineRegionAddr;
     private int trampolineRegionOsPages;
     private final long ctxBufferAddr;
+    // Allocated once: the watchdog takes it on every call.
+    private final Runnable raiseInterrupt = this::requestInterrupt;
     private final long funcTableAddr;
     private final long funcTableSize; // byte size
     private final long argsBufferAddr;
@@ -1080,26 +1083,7 @@ public final class JffiNativeMachine implements Machine {
                 throw new TrapException("interrupted");
             }
 
-            Thread caller = Thread.currentThread();
-            Thread watchdog =
-                    new Thread(
-                            () -> {
-                                // Keeps raising rather than returning after the
-                                // first: a nested call clears the flag when it
-                                // finishes, and the outer call still needs it.
-                                while (!Thread.currentThread().isInterrupted()) {
-                                    if (caller.isInterrupted()) {
-                                        requestInterrupt();
-                                    }
-                                    try {
-                                        Thread.sleep(1);
-                                    } catch (InterruptedException e) {
-                                        return;
-                                    }
-                                }
-                            });
-            watchdog.setDaemon(true);
-            watchdog.start();
+            var watch = InterruptWatchdog.watch(raiseInterrupt);
             long result;
             try {
                 result =
@@ -1112,7 +1096,7 @@ public final class JffiNativeMachine implements Machine {
                                 ctxBufferAddr,
                                 args);
             } finally {
-                watchdog.interrupt();
+                watch.close();
                 // The flag only ever means "stop this call". Left set it would
                 // trap the next one on a thread nobody interrupted.
                 clearInterrupt();

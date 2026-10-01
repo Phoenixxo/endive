@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.management.ManagementFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import run.endive.corpus.CorpusResources;
@@ -30,6 +31,22 @@ public class InterruptionTest {
         try (var instance = buildInstance("compiled/power.c.wasm")) {
             var function = instance.export("run");
             assertThreadInterruption(() -> function.apply(100));
+        }
+    }
+
+    @Test
+    public void callsDoNotStartAThreadEach() {
+        try (var instance = buildInstance("compiled/add.wat.wasm")) {
+            var add = instance.export("add");
+            add.apply(1, 2);
+            var threads = ManagementFactory.getThreadMXBean();
+            long before = threads.getTotalStartedThreadCount();
+            for (int i = 0; i < 1000; i++) {
+                assertEquals(i + 1, (int) add.apply(i, 1)[0]);
+            }
+            // The JVM may start a thread of its own meanwhile; one per call is the bug.
+            long started = threads.getTotalStartedThreadCount() - before;
+            assertTrue(started < 100, started + " threads started for 1000 calls");
         }
     }
 
