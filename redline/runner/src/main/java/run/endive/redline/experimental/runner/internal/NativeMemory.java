@@ -33,6 +33,14 @@ public final class NativeMemory implements Memory, AutoCloseable {
     private final Map<Integer, WaitState> waitStates = new ConcurrentHashMap<>();
     private final MemoryLimits limits;
     private final MemorySegment reserved;
+    // Build the value layouts at compile time and use known JIT value for lookups instead of building object for each call.
+    private static final ValueLayout.OfInt INT_LE =
+            ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong LONG_LE =
+            ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfShort SHORT_LE =
+            ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
     private MemorySegment segment;
     private int nPages;
     private final long reservedSize;
@@ -281,8 +289,7 @@ public final class NativeMemory implements Memory, AutoCloseable {
     @Override
     public void writeI32(int addr, int data) {
         try {
-            segment.set(
-                    ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN), addr, data);
+            segment.set(INT_LE, addr, data);
         } catch (IndexOutOfBoundsException e) {
             throw outOfBounds(addr);
         }
@@ -291,8 +298,7 @@ public final class NativeMemory implements Memory, AutoCloseable {
     @Override
     public int readInt(int addr) {
         try {
-            return segment.get(
-                    ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN), addr);
+            return segment.get(INT_LE, addr);
         } catch (IndexOutOfBoundsException e) {
             throw outOfBounds(addr);
         }
@@ -301,8 +307,7 @@ public final class NativeMemory implements Memory, AutoCloseable {
     @Override
     public void writeLong(int addr, long data) {
         try {
-            segment.set(
-                    ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN), addr, data);
+            segment.set(LONG_LE, addr, data);
         } catch (IndexOutOfBoundsException e) {
             throw outOfBounds(addr);
         }
@@ -311,8 +316,7 @@ public final class NativeMemory implements Memory, AutoCloseable {
     @Override
     public long readLong(int addr) {
         try {
-            return segment.get(
-                    ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN), addr);
+            return segment.get(LONG_LE, addr);
         } catch (IndexOutOfBoundsException e) {
             throw outOfBounds(addr);
         }
@@ -321,10 +325,7 @@ public final class NativeMemory implements Memory, AutoCloseable {
     @Override
     public void writeShort(int addr, short data) {
         try {
-            segment.set(
-                    ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN),
-                    addr,
-                    data);
+            segment.set(SHORT_LE, addr, data);
         } catch (IndexOutOfBoundsException e) {
             throw outOfBounds(addr);
         }
@@ -333,8 +334,7 @@ public final class NativeMemory implements Memory, AutoCloseable {
     @Override
     public short readShort(int addr) {
         try {
-            return segment.get(
-                    ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN), addr);
+            return segment.get(SHORT_LE, addr);
         } catch (IndexOutOfBoundsException e) {
             throw outOfBounds(addr);
         }
