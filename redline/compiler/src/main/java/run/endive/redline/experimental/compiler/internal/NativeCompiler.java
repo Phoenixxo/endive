@@ -101,7 +101,15 @@ public final class NativeCompiler {
     private static final int THREAD_COUNT =
             Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
 
-    private static final ExecutorService POOL = Executors.newFixedThreadPool(THREAD_COUNT);
+    // Use daemon threads to avoid keeping an active JVM running no work in the background
+    private static final ExecutorService POOL =
+            Executors.newFixedThreadPool(
+                    THREAD_COUNT,
+                    task -> {
+                        Thread thread = new Thread(task, "redline-compiler");
+                        thread.setDaemon(true);
+                        return thread;
+                    });
 
     public static byte[][] compileAll(String triple, WasmModule module) {
         return new NativeCompiler(null, triple, module).compileAll((boolean[]) null);
