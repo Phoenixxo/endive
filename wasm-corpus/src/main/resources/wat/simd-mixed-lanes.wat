@@ -1,0 +1,27 @@
+(module
+  ;; ops that combine or select lanes; the spec tests feed them uniform lanes only
+  (func (export "i32x4.dot_i16x8_s") (param v128 v128) (result v128)
+    (i32x4.dot_i16x8_s (local.get 0) (local.get 1)))
+
+  (func (export "i16x8.extadd_pairwise_i8x16_s") (param v128) (result v128)
+    (i16x8.extadd_pairwise_i8x16_s (local.get 0)))
+  (func (export "i16x8.extadd_pairwise_i8x16_u") (param v128) (result v128)
+    (i16x8.extadd_pairwise_i8x16_u (local.get 0)))
+  (func (export "i32x4.extadd_pairwise_i16x8_s") (param v128) (result v128)
+    (i32x4.extadd_pairwise_i16x8_s (local.get 0)))
+  (func (export "i32x4.extadd_pairwise_i16x8_u") (param v128) (result v128)
+    (i32x4.extadd_pairwise_i16x8_u (local.get 0)))
+
+  (func (export "i16x8.extmul_low_i8x16_s") (param v128 v128) (result v128)
+    (i16x8.extmul_low_i8x16_s (local.get 0) (local.get 1)))
+  (func (export "i16x8.extmul_high_i8x16_u") (param v128 v128) (result v128)
+    (i16x8.extmul_high_i8x16_u (local.get 0) (local.get 1)))
+  (func (export "i32x4.extmul_low_i16x8_u") (param v128 v128) (result v128)
+    (i32x4.extmul_low_i16x8_u (local.get 0) (local.get 1)))
+  (func (export "i32x4.extmul_high_i16x8_s") (param v128 v128) (result v128)
+    (i32x4.extmul_high_i16x8_s (local.get 0) (local.get 1)))
+  (func (export "i64x2.extmul_low_i32x4_s") (param v128 v128) (result v128)
+    (i64x2.extmul_low_i32x4_s (local.get 0) (local.get 1)))
+  (func (export "i64x2.extmul_high_i32x4_u") (param v128 v128) (result v128)
+    (i64x2.extmul_high_i32x4_u (local.get 0) (local.get 1)))
+)

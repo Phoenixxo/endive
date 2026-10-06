@@ -1,0 +1,26 @@
+(module
+  (memory 1)
+
+  ;; an access that ends past the last byte of memory must trap, without partial writes
+  (func (export "v128.load") (param $addr i32) (result i64)
+    (i64x2.extract_lane 0 (v128.load (local.get $addr))))
+  (func (export "v128.load8_lane") (param $addr i32) (result i64)
+    (i64x2.extract_lane 0 (v128.load8_lane 0 (local.get $addr) (v128.const i64x2 0 0))))
+  (func (export "v128.load16_lane") (param $addr i32) (result i64)
+    (i64x2.extract_lane 0 (v128.load16_lane 0 (local.get $addr) (v128.const i64x2 0 0))))
+  (func (export "v128.load32_lane") (param $addr i32) (result i64)
+    (i64x2.extract_lane 0 (v128.load32_lane 0 (local.get $addr) (v128.const i64x2 0 0))))
+  (func (export "v128.load64_lane") (param $addr i32) (result i64)
+    (i64x2.extract_lane 0 (v128.load64_lane 0 (local.get $addr) (v128.const i64x2 0 0))))
+
+  (func (export "v128.store") (param $addr i32)
+    (v128.store (local.get $addr) (v128.const i64x2 -1 -1)))
+  (func (export "v128.store8_lane") (param $addr i32)
+    (v128.store8_lane 0 (local.get $addr) (v128.const i64x2 -1 -1)))
+  (func (export "v128.store16_lane") (param $addr i32)
+    (v128.store16_lane 0 (local.get $addr) (v128.const i64x2 -1 -1)))
+  (func (export "v128.store32_lane") (param $addr i32)
+    (v128.store32_lane 0 (local.get $addr) (v128.const i64x2 -1 -1)))
+  (func (export "v128.store64_lane") (param $addr i32)
+    (v128.store64_lane 0 (local.get $addr) (v128.const i64x2 -1 -1)))
+)
