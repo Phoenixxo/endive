@@ -22,11 +22,9 @@ public class TableInitExprTest {
 
         try (var instance =
                 JffiNativeMachineFactory.builder(module)
-                        .withCompilerFunction(
-                                m ->
-                                        NativeCompiler.compileAll(
-                                                RedlineTarget.detectHost().orElseThrow().triple(),
-                                                m))
+                        .withPrecompiledCode(
+                                NativeCompiler.compile(
+                                        RedlineTarget.detectHost().orElseThrow().triple(), module))
                         .build()) {
             assertEquals(
                     42,

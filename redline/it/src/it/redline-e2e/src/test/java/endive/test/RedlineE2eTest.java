@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -134,6 +135,18 @@ class RedlineE2eTest {
                         + " cross-compiled for it");
         assertNotNull(
                 AddModule.loadNativeCode(), "Native code should be available on this platform");
+    }
+
+    /** Native code is compiled at build time, so the compiler must not ship with the runner. */
+    @Test
+    public void compilerIsNotOnTheRuntimeClasspath() {
+        for (String name :
+                new String[] {
+                    "run.endive.redline.experimental.bridge.internal.CraneliftBridge",
+                    "run.endive.redline.experimental.compiler.internal.NativeCompiler"
+                }) {
+            assertThrows(ClassNotFoundException.class, () -> Class.forName(name), name);
+        }
     }
 
     @Test

@@ -83,11 +83,9 @@ public class ReentrantStackGuardTest {
         try (var instance =
                 NativeMachineFactory.builder(module)
                         .withImportValues(imports)
-                        .withCompilerFunction(
-                                m ->
-                                        NativeCompiler.compileAll(
-                                                RedlineTarget.detectHost().orElseThrow().triple(),
-                                                m))
+                        .withPrecompiledCode(
+                                NativeCompiler.compile(
+                                        RedlineTarget.detectHost().orElseThrow().triple(), module))
                         .build()) {
             instance.export("recurse").apply();
         }

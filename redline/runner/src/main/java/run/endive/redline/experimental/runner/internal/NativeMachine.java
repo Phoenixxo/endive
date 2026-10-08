@@ -10,14 +10,11 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.ref.Reference;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.function.Function;
+import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.api.internal.CtxBuffer;
 import run.endive.redline.experimental.api.internal.InterruptWatchdog;
-import run.endive.redline.experimental.api.internal.RedlineTarget;
+import run.endive.redline.experimental.api.internal.NativeCodeCheck;
 import run.endive.redline.experimental.api.internal.TypeMapUtils;
-import run.endive.redline.experimental.bridge.internal.CraneliftBridge;
 import run.endive.runtime.Instance;
 import run.endive.runtime.Machine;
 import run.endive.runtime.TrapException;
@@ -45,6 +42,7 @@ import run.endive.wasm.types.Value;
 public final class NativeMachine implements Machine {
 
     private static final int CTX_SIZE = CtxBuffer.CTX_SIZE;
+    private static final long PAGE_SIZE = 4096;
 
     // Conversion handles for adapting downcalls to uniform (MS, MS, long[]) → long.
     // These use Wasm bit-reinterpretation (not numeric casts).
@@ -86,8 +84,6 @@ public final class NativeMachine implements Machine {
     private final MethodHandle[] downcalls;
     private final MemorySegment codeRegion;
     private final long codeRegionSize;
-    private MemorySegment trampolineRegion;
-    private long trampolineRegionSize;
     private final MemorySegment ctxBuffer;
     private final MemorySegment funcTable;
     private final MemorySegment argsBuffer;
@@ -113,11 +109,11 @@ public final class NativeMachine implements Machine {
             Arena arena,
             java.util.List<NativeTable> sharedTables,
             MemorySegment sharedGlobalsBuffer,
-            byte[][] precompiledCode,
-            Function<run.endive.wasm.WasmModule, byte[][]> compilerFunction) {
+            NativeCode precompiledCode) {
         this.instance = instance;
         this.arena = arena;
         var module = instance.module();
+        NativeCode code = NativeCodeCheck.check(precompiledCode, module);
         this.numImports =
                 (int)
                         module.importSection().stream()
@@ -176,11 +172,14 @@ public final class NativeMachine implements Machine {
         this.tablePtrsArray = MemorySegment.NULL;
         this.tablesInitialized = false;
 
-        // Create CALL_INDIRECT trampoline upcall stub (kept for TABLE.INIT/ELEM.DROP)
+        // Host stubs are called by compiled code with the platform ABI
         MemorySegment trampolineStub = createTrampolineStub();
-
-        // Create memory.grow upcall stub
         MemorySegment memGrowStub = createMemGrowStub();
+        MemorySegment[] importStubs = new MemorySegment[numImports];
+        for (int funcId = 0; funcId < numImports; funcId++) {
+            var funcType = instance.imports().function(funcId).functionType();
+            importStubs[funcId] = createImportStub(funcId, funcType);
+        }
 
         // Write pointers to ctxBuffer
         ctxBuffer.set(ValueLayout.JAVA_LONG, CtxBuffer.FUNC_TABLE_PTR, funcTable.address());
@@ -193,167 +192,44 @@ public final class NativeMachine implements Machine {
         ctxBuffer.set(ValueLayout.JAVA_LONG, CtxBuffer.MEMMOVE_PTR, PanamaExecutor.MEMMOVE_ADDR);
         ctxBuffer.set(ValueLayout.JAVA_LONG, CtxBuffer.MEMSET_PTR, PanamaExecutor.MEMSET_ADDR);
 
-        // Use pre-compiled code, or compile at runtime if explicitly enabled
-        byte[][] compiledCode;
-        if (precompiledCode != null) {
-            compiledCode = precompiledCode;
-        } else if (compilerFunction != null) {
-            compiledCode = compilerFunction.apply(module);
-        } else {
-            throw new WasmEngineException(
-                    "No precompiled code provided. Use the redline-compiler-maven-plugin"
-                            + " to precompile, or use NativeMachineFactory.builder(module)"
-                            + " for runtime compilation.");
-        }
-
-        // mmap all compiled code into a single executable region
-        long totalSize = 0;
-        for (byte[] code : compiledCode) {
-            if (code != null) {
-                totalSize += CraneliftBridge.align(code.length, 16);
-            }
-        }
-        totalSize = Math.max(totalSize, 4096);
-        totalSize = CraneliftBridge.align(totalSize, 4096);
-        this.codeRegionSize = totalSize;
+        byte[] image = code.image();
+        this.codeRegionSize = (Math.max(image.length, 1) + PAGE_SIZE - 1) & -PAGE_SIZE;
 
         try {
-            codeRegion = PanamaExecutor.mmapCode(totalSize);
-            long offset = 0;
+            codeRegion = PanamaExecutor.mmapCode(codeRegionSize);
+            MemorySegment.copy(MemorySegment.ofArray(image), 0, codeRegion, 0, image.length);
+            for (int funcId = 0; funcId < numImports; funcId++) {
+                codeRegion.set(
+                        ValueLayout.JAVA_LONG_UNALIGNED,
+                        code.importStubSlotOffset(funcId),
+                        importStubs[funcId].address());
+            }
+            PanamaExecutor.mprotectExec(codeRegion, codeRegionSize);
 
-            // Track per-function code pointers and types for downcall creation after trampolines
-            MemorySegment[] funcCodePtrs = new MemorySegment[compiledCode.length];
-            FunctionType[] funcTypesByBody = new FunctionType[compiledCode.length];
+            // Compiled code reaches imports through their trampolines
+            for (int funcId = 0; funcId < numImports; funcId++) {
+                funcTable.setAtIndex(
+                        ValueLayout.JAVA_LONG,
+                        funcId,
+                        codeRegion.address() + code.importTrampolineOffset(funcId));
+            }
 
-            for (int i = 0; i < compiledCode.length; i++) {
-                if (compiledCode[i] != null) {
+            for (int i = 0; i < code.functionBodyCount(); i++) {
+                if (code.isCompiled(i)) {
                     int funcId = numImports + i;
-                    MemorySegment.copy(
-                            MemorySegment.ofArray(compiledCode[i]),
-                            0,
-                            codeRegion,
-                            offset,
-                            compiledCode[i].length);
-
                     var funcType =
                             (FunctionType)
                                     module.typeSection()
                                             .getType(module.functionSection().getFunctionType(i));
-
-                    MemorySegment codePtr = codeRegion.asSlice(offset);
-                    funcCodePtrs[i] = codePtr;
-                    funcTypesByBody[i] = funcType;
-
-                    // Store native code address in function pointer table (Tail convention)
-                    funcTable.set(ValueLayout.JAVA_LONG, (long) funcId * 8, codePtr.address());
-
-                    offset += CraneliftBridge.align(compiledCode[i].length, 16);
+                    MemorySegment codePtr = codeRegion.asSlice(code.bodyOffset(i));
+                    funcTable.setAtIndex(ValueLayout.JAVA_LONG, funcId, codePtr.address());
+                    downcalls[funcId] =
+                            createDowncallViaTrampoline(
+                                    codeRegion.asSlice(code.entryTrampolineOffset(i)),
+                                    codePtr,
+                                    funcType);
                 }
             }
-            PanamaExecutor.mprotectExec(codeRegion, totalSize);
-
-            // Create import upcall stubs (platform ABI)
-            MemorySegment[] importStubs = new MemorySegment[numImports];
-            FunctionType[] importTypes = new FunctionType[numImports];
-            for (int funcId = 0; funcId < numImports; funcId++) {
-                var importFunc = instance.imports().function(funcId);
-                var funcType = importFunc.functionType();
-                importStubs[funcId] = createImportStub(funcId, funcType);
-                importTypes[funcId] = funcType;
-                downcalls[funcId] = null; // imports dispatch through call() directly
-            }
-
-            // Compile ABI trampolines via Cranelift bridge
-            long[] importStubAddrs = new long[numImports];
-            for (int i = 0; i < numImports; i++) {
-                importStubAddrs[i] = importStubs[i].address();
-            }
-            try (var bridge = new CraneliftBridge()) {
-                bridge.init(
-                        RedlineTarget.detectHost()
-                                .orElseThrow(
-                                        () ->
-                                                new WasmEngineException(
-                                                        "Unsupported platform for native"
-                                                                + " compilation"))
-                                .triple());
-                var trampolines =
-                        bridge.compileTrampolines(
-                                compiledCode,
-                                funcTypesByBody,
-                                importTypes,
-                                importStubAddrs,
-                                trampolineStub.address(),
-                                memGrowStub.address(),
-                                PanamaExecutor.MEMMOVE_ADDR,
-                                PanamaExecutor.MEMSET_ADDR);
-
-                long trampTotalSize = Math.max(trampolines.totalSize(), 4096);
-                trampTotalSize = CraneliftBridge.align(trampTotalSize, 4096);
-                this.trampolineRegionSize = trampTotalSize;
-
-                // Mmap and copy trampoline code
-                trampolineRegion = PanamaExecutor.mmapCode(trampTotalSize);
-                long trampOffset = 0;
-
-                // Copy entry trampolines and record their addresses
-                Map<FunctionType, MemorySegment> entryTrampolinePtrs = new HashMap<>();
-                for (var entry : trampolines.entryTrampolines().entrySet()) {
-                    entryTrampolinePtrs.put(entry.getKey(), trampolineRegion.asSlice(trampOffset));
-                    trampOffset = copyCode(entry.getValue(), trampolineRegion, trampOffset);
-                }
-
-                // Copy import trampolines and store addresses in funcTable
-                for (int funcId = 0; funcId < numImports; funcId++) {
-                    byte[] code = trampolines.importTrampolines()[funcId];
-                    long addr = trampolineRegion.asSlice(trampOffset).address();
-                    trampOffset = copyCode(code, trampolineRegion, trampOffset);
-                    funcTable.set(ValueLayout.JAVA_LONG, (long) funcId * 8, addr);
-                }
-
-                // Copy internal stub trampolines and update ctxBuffer
-                trampOffset =
-                        copyCodeAndUpdateCtx(
-                                trampolines.trampolineStubTramp(),
-                                trampolineRegion,
-                                trampOffset,
-                                ctxBuffer,
-                                CtxBuffer.TRAMPOLINE_PTR);
-                trampOffset =
-                        copyCodeAndUpdateCtx(
-                                trampolines.memGrowStubTramp(),
-                                trampolineRegion,
-                                trampOffset,
-                                ctxBuffer,
-                                CtxBuffer.MEM_GROW_PTR);
-                trampOffset =
-                        copyCodeAndUpdateCtx(
-                                trampolines.memmoveTramp(),
-                                trampolineRegion,
-                                trampOffset,
-                                ctxBuffer,
-                                CtxBuffer.MEMMOVE_PTR);
-                copyCodeAndUpdateCtx(
-                        trampolines.memsetTramp(),
-                        trampolineRegion,
-                        trampOffset,
-                        ctxBuffer,
-                        CtxBuffer.MEMSET_PTR);
-
-                PanamaExecutor.mprotectExec(trampolineRegion, trampTotalSize);
-
-                // Create downcall handles via entry trampolines
-                for (int i = 0; i < compiledCode.length; i++) {
-                    if (compiledCode[i] != null) {
-                        int funcId = numImports + i;
-                        MemorySegment trampolinePtr = entryTrampolinePtrs.get(funcTypesByBody[i]);
-                        downcalls[funcId] =
-                                createDowncallViaTrampoline(
-                                        trampolinePtr, funcCodePtrs[i], funcTypesByBody[i]);
-                    }
-                }
-            }
-
         } catch (Throwable e) {
             throw new WasmEngineException("Failed to set up native code", e);
         }
@@ -382,9 +258,6 @@ public final class NativeMachine implements Machine {
         }
         try {
             PanamaExecutor.munmap(codeRegion, codeRegionSize);
-            if (trampolineRegion != null && trampolineRegionSize > 0) {
-                PanamaExecutor.munmap(trampolineRegion, trampolineRegionSize);
-            }
         } catch (Throwable e) {
             throw new WasmEngineException("Failed to unmap native code", e);
         }
@@ -978,19 +851,6 @@ public final class NativeMachine implements Machine {
             case CtxBuffer.TRAP_INTERRUPTED -> new WasmInterruptedException("Thread interrupted");
             default -> new WasmEngineException("trap: unknown code " + trapCode);
         };
-    }
-
-    // --- Trampoline copy helpers ---
-
-    private static long copyCode(byte[] code, MemorySegment region, long offset) {
-        MemorySegment.copy(MemorySegment.ofArray(code), 0, region, offset, code.length);
-        return offset + CraneliftBridge.align(code.length, 16);
-    }
-
-    private static long copyCodeAndUpdateCtx(
-            byte[] code, MemorySegment region, long offset, MemorySegment ctxBuf, long ctxOffset) {
-        ctxBuf.set(ValueLayout.JAVA_LONG, ctxOffset, region.asSlice(offset).address());
-        return copyCode(code, region, offset);
     }
 
     // --- Main dispatch ---

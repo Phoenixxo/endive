@@ -69,7 +69,7 @@ public final class RedlineGenerator {
                                     () ->
                                             new IllegalArgumentException(
                                                     "Unknown target triple: " + triple));
-            byte[][] compiledCode = NativeCompiler.compileAll(triple, module);
+            var compiledCode = NativeCompiler.compile(triple, module);
             var nativeFile =
                     resourceDir.resolve(baseName + "." + target.resourceSuffix() + ".native");
 
@@ -91,6 +91,7 @@ public final class RedlineGenerator {
         var cu = StaticJavaParser.parse(sourceFile);
         var type = cu.getClassByName(baseName).orElseThrow();
 
+        cu.addImport("run.endive.redline.experimental.api.NativeCode");
         cu.addImport("run.endive.redline.experimental.api.NativeCodeSerializer");
         cu.addImport("run.endive.redline.experimental.api.ImportFactory");
         cu.addImport("run.endive.redline.experimental.api.NativeMachineFactoryProvider");
@@ -115,9 +116,9 @@ public final class RedlineGenerator {
         // Generates:
         // <code>
         //     private static class NativeCodeHolder {
-        //         static final byte[][] CODE;
+        //         static final NativeCode CODE;
         //         static {
-        //             byte[][] loaded = null;
+        //             NativeCode loaded = null;
         //             var host = RedlineTarget.detectHost().orElse(null);
         //             if (host != null) {
         //                 String resource = "<moduleName>." + host.resourceSuffix() + ".native";
@@ -149,14 +150,14 @@ public final class RedlineGenerator {
         type.addMember(holderClass);
 
         holderClass.addField(
-                parseType("byte[][]"), "CODE", Modifier.Keyword.STATIC, Modifier.Keyword.FINAL);
+                parseType("NativeCode"), "CODE", Modifier.Keyword.STATIC, Modifier.Keyword.FINAL);
 
-        // byte[][] loaded = null;
+        // NativeCode loaded = null;
         var loadedVar =
                 new ExpressionStmt(
                         new VariableDeclarationExpr(
                                 new VariableDeclarator(
-                                        parseType("byte[][]"), "loaded", new NullLiteralExpr())));
+                                        parseType("NativeCode"), "loaded", new NullLiteralExpr())));
 
         // var host = RedlineTarget.detectHost().orElse(null);
         var detectHost =
@@ -260,13 +261,13 @@ public final class RedlineGenerator {
     private static void generateLoadNativeCodeMethod(ClassOrInterfaceDeclaration type) {
         // Generates:
         // <code>
-        //     public static byte[][] loadNativeCode() {
+        //     public static NativeCode loadNativeCode() {
         //         return NativeCodeHolder.CODE;
         //     }
         // </code>
         var method =
                 type.addMethod("loadNativeCode", Modifier.Keyword.PUBLIC, Modifier.Keyword.STATIC)
-                        .setType(parseType("byte[][]"));
+                        .setType(parseType("NativeCode"));
         method.createBody()
                 .addStatement(
                         new ReturnStmt(

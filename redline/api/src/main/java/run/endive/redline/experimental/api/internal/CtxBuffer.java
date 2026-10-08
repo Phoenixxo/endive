@@ -28,6 +28,8 @@ package run.endive.redline.experimental.api.internal;
  * ------  -----  ----------------  ------------------------------------------
  * Total: 248 bytes used, 256 allocated (CTX_SIZE)
  * </pre>
+ *
+ * <p>Compiled code calls the host function pointers here with the platform ABI.
  */
 public final class CtxBuffer {
 

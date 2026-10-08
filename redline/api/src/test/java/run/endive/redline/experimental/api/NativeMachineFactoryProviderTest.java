@@ -74,7 +74,7 @@ public class NativeMachineFactoryProviderTest {
 
     public static class LowProvider implements NativeMachineFactoryProvider {
         @Override
-        public Instance.Builder builder(WasmModule module, byte[][] precompiledCode) {
+        public Instance.Builder builder(WasmModule module, NativeCode precompiledCode) {
             return null;
         }
 

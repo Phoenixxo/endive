@@ -38,10 +38,9 @@ public class LifecycleTest {
 
     private static run.endive.runtime.Instance build(WasmModule module) {
         return JffiNativeMachineFactory.builder(module)
-                .withCompilerFunction(
-                        m ->
-                                NativeCompiler.compileAll(
-                                        RedlineTarget.detectHost().orElseThrow().triple(), m))
+                .withPrecompiledCode(
+                        NativeCompiler.compile(
+                                RedlineTarget.detectHost().orElseThrow().triple(), module))
                 .build();
     }
 }

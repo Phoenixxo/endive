@@ -26,7 +26,7 @@ public final class ImportFactory {
      * Picks the backend for a module holding this native code, or none. Called by the
      * generated {@code imports()}.
      */
-    public static ImportFactory forNativeCode(byte[][] nativeCode) {
+    public static ImportFactory forNativeCode(NativeCode nativeCode) {
         if (nativeCode == null) {
             return forBytecode();
         }

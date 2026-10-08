@@ -6,7 +6,8 @@
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
-use cranelift_codegen::ir::{AbiParam, AtomicRmwOp, BlockArg, BlockCall, Function, InstBuilder, MemFlagsData, Signature, UserFuncName};
+use cranelift_codegen::ir::{AbiParam, AtomicRmwOp, BlockArg, BlockCall, ExtFuncData, ExternalName, Function, InstBuilder, MemFlagsData, Signature, UserExternalName, UserFuncName};
+use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::isa::{self, CallConv, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
@@ -1633,6 +1634,13 @@ pub extern "C" fn begin_sig() {
     s().sig_builder = Some(Signature::new(CallConv::Tail));
 }
 
+/// Like begin_sig, but for calling a host function with the platform ABI.
+#[no_mangle]
+pub extern "C" fn begin_platform_sig() {
+    let isa = unsafe { ISA.as_ref().expect("ISA not initialized") };
+    s().sig_builder = Some(Signature::new(isa.default_call_conv()));
+}
+
 /// Add a parameter type to the current signature being built.
 #[no_mangle]
 pub extern "C" fn sig_add_param(wasm_type: u32) {
@@ -1737,6 +1745,9 @@ pub extern "C" fn compile() -> u32 {
     let compiled = ctx
         .compile(isa.as_ref(), &mut ControlPlane::default())
         .expect("Compilation failed");
+    // Function bodies are loaded at any address, so they must not need patching
+    let relocs = compiled.buffer.relocs();
+    assert!(relocs.is_empty(), "Compiled code needs relocations: {:?}", relocs);
 
     let code = compiled.code_buffer();
 
@@ -1796,7 +1807,7 @@ fn compile_trampoline(
         cranelift_codegen::ir::SigRef,
         &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Inst,
-) -> u32 {
+) -> (u32, Vec<(u32, Reloc, i64)>) {
     let isa = unsafe { ISA.as_ref().expect("ISA not initialized") };
     let mut func = Function::with_name_signature(UserFuncName::user(0, 0), outer_sig);
     let sig_ref = func.import_signature(inner_sig);
@@ -1820,10 +1831,18 @@ fn compile_trampoline(
         .compile(isa.as_ref(), &mut ControlPlane::default())
         .expect("Trampoline compilation failed");
 
+    let code = compiled.code_buffer().to_vec();
+    let len = code.len() as u32;
+    let relocs = compiled
+        .buffer
+        .relocs()
+        .iter()
+        .map(|r| (r.offset, r.kind, r.addend))
+        .collect();
     unsafe {
-        COMPILED_CODE = compiled.code_buffer().to_vec();
-        COMPILED_CODE.len() as u32
+        COMPILED_CODE = code;
     }
+    (len, relocs)
 }
 
 fn copy_sig(src: &Signature, conv: CallConv) -> Signature {
@@ -1846,25 +1865,37 @@ pub extern "C" fn compile_entry_trampoline() -> u32 {
     for p in &tail_sig.params { outer_sig.params.push(p.clone()); }
     for r in &tail_sig.returns { outer_sig.returns.push(r.clone()); }
 
-    compile_trampoline(outer_sig, tail_sig, |builder, sig_ref, params| {
+    let (len, relocs) = compile_trampoline(outer_sig, tail_sig, |builder, sig_ref, params| {
         builder.ins().call_indirect(sig_ref, params[0], &params[1..])
-    })
+    });
+    assert!(relocs.is_empty(), "Entry trampoline needs relocations: {:?}", relocs);
+    len
 }
 
-/// Compile an import trampoline: Tail convention → platform ABI.
-/// Takes (memBase, ctxPtr, args...) with Tail convention,
-/// calls platform-ABI stub at baked-in address.
+/// Import trampoline whose stub address is patched at load; returns that 8-byte slot's offset.
 #[no_mangle]
-pub extern "C" fn compile_import_trampoline(stub_addr_lo: u32, stub_addr_hi: u32) -> u32 {
+pub extern "C" fn compile_import_trampoline() -> u32 {
     let isa = unsafe { ISA.as_ref().expect("ISA not initialized") };
     let tail_sig = unsafe { TRAMPOLINE_SIG.take().expect("No trampoline sig") };
-    let stub_addr = ((stub_addr_hi as u64) << 32) | (stub_addr_lo as u64);
 
     let outer_sig = copy_sig(&tail_sig, CallConv::Tail);
     let platform_sig = copy_sig(&tail_sig, isa.default_call_conv());
 
-    compile_trampoline(outer_sig, platform_sig, |builder, sig_ref, params| {
-        let stub_ptr = builder.ins().iconst(types::I64, stub_addr as i64);
+    let (_, relocs) = compile_trampoline(outer_sig, platform_sig, |builder, sig_ref, params| {
+        let name = builder
+            .func
+            .declare_imported_user_function(UserExternalName::new(0, 0));
+        let stub = builder.import_function(ExtFuncData {
+            name: ExternalName::user(name),
+            signature: sig_ref,
+            colocated: false,
+            patchable: false,
+        });
+        let stub_ptr = builder.ins().func_addr(types::I64, stub);
         builder.ins().call_indirect(sig_ref, stub_ptr, params)
-    })
+    });
+    match relocs.as_slice() {
+        [(offset, Reloc::Abs8, 0)] => *offset,
+        _ => panic!("Import trampoline needs unexpected relocations: {:?}", relocs),
+    }
 }

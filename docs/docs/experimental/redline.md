@@ -13,7 +13,8 @@ modes, so check [Feature support](#feature-support) before adopting it.
 
 Redline compiles your Wasm module to native machine code using [Cranelift](https://cranelift.dev/),
 instead of to JVM bytecode. Compilation happens at build time for every supported platform, and the
-right one is selected at runtime.
+right one is selected at runtime. Nothing is compiled at runtime: the runners only load the
+precompiled code, and Cranelift is not one of their dependencies.
 
 It is a substitute for the [Build Time Compiler](../execution/build-time-compiler.md) only, not for
 the interpreter or the [Runtime Compiler](../execution/runtime-compiler.md), and it is enabled on

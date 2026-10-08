@@ -1,5 +1,6 @@
 package run.endive.redline.experimental.runner.jffi;
 
+import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.api.NativeMachineFactoryProvider;
 import run.endive.runtime.GlobalInstance;
 import run.endive.runtime.Instance;
@@ -14,7 +15,7 @@ import run.endive.wasm.types.Value;
 public final class JffiMachineFactoryProvider implements NativeMachineFactoryProvider {
 
     @Override
-    public Instance.Builder builder(WasmModule module, byte[][] precompiledCode) {
+    public Instance.Builder builder(WasmModule module, NativeCode precompiledCode) {
         return JffiNativeMachineFactory.builder(module)
                 .withPrecompiledCode(precompiledCode)
                 .toInstanceBuilder();

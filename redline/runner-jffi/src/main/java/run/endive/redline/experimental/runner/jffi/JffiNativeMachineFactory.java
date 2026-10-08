@@ -3,7 +3,7 @@ package run.endive.redline.experimental.runner.jffi;
 import com.kenai.jffi.MemoryIO;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
+import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.runner.jffi.internal.JffiNativeGlobalInstance;
 import run.endive.redline.experimental.runner.jffi.internal.JffiNativeMachine;
 import run.endive.redline.experimental.runner.jffi.internal.JffiNativeMemory;
@@ -25,20 +25,15 @@ public final class JffiNativeMachineFactory {
     private static final MemoryIO MEM = MemoryIO.getInstance();
 
     private final WasmModule module;
-    private final byte[][] precompiledCode;
-    private final Function<WasmModule, byte[][]> compilerFunction;
+    private final NativeCode precompiledCode;
     private final List<JffiNativeTable> nativeTables = new ArrayList<>();
     private long globalsBufferAddr;
     private int globalIndex;
     private JffiNativeMachine nativeMachine;
 
-    private JffiNativeMachineFactory(
-            WasmModule module,
-            byte[][] precompiledCode,
-            Function<WasmModule, byte[][]> compilerFunction) {
+    private JffiNativeMachineFactory(WasmModule module, NativeCode precompiledCode) {
         this.module = module;
         this.precompiledCode = precompiledCode;
-        this.compilerFunction = compilerFunction;
 
         int importGlobalCount =
                 (int)
@@ -99,20 +94,14 @@ public final class JffiNativeMachineFactory {
         this.globalIndex = importGlobalCount;
         this.nativeTables.clear();
         this.nativeMachine =
-                new JffiNativeMachine(
-                        instance,
-                        nativeTables,
-                        globalsBufferAddr,
-                        precompiledCode,
-                        compilerFunction);
+                new JffiNativeMachine(instance, nativeTables, globalsBufferAddr, precompiledCode);
         return nativeMachine;
     }
 
     public static final class Builder {
 
         private final WasmModule module;
-        private byte[][] precompiledCode;
-        private Function<WasmModule, byte[][]> compilerFunction;
+        private NativeCode precompiledCode;
         private ImportValues importValues;
         private MemoryLimits memoryLimits;
         private boolean start = true;
@@ -122,13 +111,8 @@ public final class JffiNativeMachineFactory {
             this.module = module;
         }
 
-        public Builder withPrecompiledCode(byte[][] precompiledCode) {
+        public Builder withPrecompiledCode(NativeCode precompiledCode) {
             this.precompiledCode = precompiledCode;
-            return this;
-        }
-
-        public Builder withCompilerFunction(Function<WasmModule, byte[][]> compilerFunction) {
-            this.compilerFunction = compilerFunction;
             return this;
         }
 
@@ -153,7 +137,7 @@ public final class JffiNativeMachineFactory {
         }
 
         public Instance.Builder toInstanceBuilder() {
-            var factory = new JffiNativeMachineFactory(module, precompiledCode, compilerFunction);
+            var factory = new JffiNativeMachineFactory(module, precompiledCode);
             return Instance.builder(module)
                     .withMachineFactory(factory::compile)
                     .withTableFactory(factory::createTable)

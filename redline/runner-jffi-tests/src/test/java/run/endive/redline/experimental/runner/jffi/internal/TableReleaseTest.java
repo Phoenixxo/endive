@@ -64,11 +64,9 @@ public class TableReleaseTest {
     private static run.endive.runtime.Instance build(WasmModule module, ImportValues imports) {
         var builder =
                 JffiNativeMachineFactory.builder(module)
-                        .withCompilerFunction(
-                                m ->
-                                        NativeCompiler.compileAll(
-                                                RedlineTarget.detectHost().orElseThrow().triple(),
-                                                m));
+                        .withPrecompiledCode(
+                                NativeCompiler.compile(
+                                        RedlineTarget.detectHost().orElseThrow().triple(), module));
         if (imports != null) {
             builder.withImportValues(imports);
         }

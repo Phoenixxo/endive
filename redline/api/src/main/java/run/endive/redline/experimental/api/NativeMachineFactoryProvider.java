@@ -15,7 +15,7 @@ import run.endive.wasm.types.Value;
 
 public interface NativeMachineFactoryProvider {
 
-    Instance.Builder builder(WasmModule module, byte[][] precompiledCode);
+    Instance.Builder builder(WasmModule module, NativeCode precompiledCode);
 
     Memory createMemory(MemoryLimits limits);
 

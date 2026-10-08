@@ -221,6 +221,7 @@ final class EmitContext {
         return sigRef;
     }
 
+    /** Signature for the host stubs taking the ctx pointer: (i64) -> i64, platform ABI. */
     int getOrCreateTrampolineSigRef() {
         String key = "__trampoline__";
         Integer cached = sigRefCache.get(key);
@@ -228,7 +229,7 @@ final class EmitContext {
             return cached;
         }
 
-        bridge.exports().beginSig();
+        bridge.exports().beginPlatformSig();
         bridge.exports().sigAddParam(CraneliftBridge.TYPE_I64);
         bridge.exports().sigAddReturn(CraneliftBridge.TYPE_I64);
         int sigRef = bridge.exports().endSig();
@@ -236,7 +237,7 @@ final class EmitContext {
         return sigRef;
     }
 
-    /** Signature for memmove/memset: (i64, i64, i64) -> i64. */
+    /** Signature for memmove/memset: (i64, i64, i64) -> i64, platform ABI. */
     int getOrCreateMemopSigRef() {
         String key = "__memop__";
         Integer cached = sigRefCache.get(key);
@@ -244,7 +245,7 @@ final class EmitContext {
             return cached;
         }
 
-        bridge.exports().beginSig();
+        bridge.exports().beginPlatformSig();
         bridge.exports().sigAddParam(CraneliftBridge.TYPE_I64); // dst ptr
         bridge.exports().sigAddParam(CraneliftBridge.TYPE_I64); // src ptr / value
         bridge.exports().sigAddParam(CraneliftBridge.TYPE_I64); // size

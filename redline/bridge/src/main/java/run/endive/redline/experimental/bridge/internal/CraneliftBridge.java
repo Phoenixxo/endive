@@ -1,13 +1,10 @@
 package run.endive.redline.experimental.bridge.internal;
 
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
 import run.endive.runtime.ImportValues;
 import run.endive.runtime.Instance;
 import run.endive.wasi.WasiOptions;
 import run.endive.wasi.WasiPreview1;
-import run.endive.wasm.types.FunctionType;
 import run.endive.wasm.types.ValType;
 
 public final class CraneliftBridge implements AutoCloseable {
@@ -76,160 +73,11 @@ public final class CraneliftBridge implements AutoCloseable {
 
     public byte[] compile() {
         exports.compile();
-        int codePtr = exports.getCodePtr();
-        int codeLen = exports.getCodeLen();
-        return exports.memory().readBytes(codePtr, codeLen);
+        return compiledCode();
     }
 
-    private void buildTrampolineSig(FunctionType funcType) {
-        exports.beginTrampolineSig();
-        exports.trampolineSigAddParam(TYPE_I64); // memBase
-        exports.trampolineSigAddParam(TYPE_I64); // ctxPtr
-        for (ValType param : funcType.params()) {
-            exports.trampolineSigAddParam(valTypeToBridgeType(param));
-        }
-        if (funcType.returns().size() > 1) {
-            exports.trampolineSigAddReturn(TYPE_I64);
-        } else {
-            for (ValType ret : funcType.returns()) {
-                exports.trampolineSigAddReturn(valTypeToBridgeType(ret));
-            }
-        }
-    }
-
-    private byte[] readCompiledCode() {
-        int ptr = exports.getCodePtr();
-        int len = exports.getCodeLen();
-        return exports.memory().readBytes(ptr, len);
-    }
-
-    private byte[] compileImportTrampolineRaw(long stubAddr) {
-        exports.compileImportTrampoline((int) (stubAddr & 0xFFFFFFFFL), (int) (stubAddr >>> 32));
-        return readCompiledCode();
-    }
-
-    public byte[] compileEntryTrampoline(FunctionType funcType) {
-        buildTrampolineSig(funcType);
-        exports.compileEntryTrampoline();
-        return readCompiledCode();
-    }
-
-    public byte[] compileImportTrampoline(FunctionType funcType, long stubAddr) {
-        buildTrampolineSig(funcType);
-        return compileImportTrampolineRaw(stubAddr);
-    }
-
-    public byte[] compileStubTrampoline(long stubAddr, int[] paramTypes, int[] returnTypes) {
-        exports.beginTrampolineSig();
-        for (int p : paramTypes) {
-            exports.trampolineSigAddParam(p);
-        }
-        for (int r : returnTypes) {
-            exports.trampolineSigAddReturn(r);
-        }
-        return compileImportTrampolineRaw(stubAddr);
-    }
-
-    public static final class CompiledTrampolines {
-        private final Map<FunctionType, byte[]> entryTrampolines;
-        private final byte[][] importTrampolines;
-        private final byte[] trampolineStubTramp;
-        private final byte[] memGrowStubTramp;
-        private final byte[] memmoveTramp;
-        private final byte[] memsetTramp;
-
-        private CompiledTrampolines(
-                Map<FunctionType, byte[]> entryTrampolines,
-                byte[][] importTrampolines,
-                byte[] trampolineStubTramp,
-                byte[] memGrowStubTramp,
-                byte[] memmoveTramp,
-                byte[] memsetTramp) {
-            this.entryTrampolines = entryTrampolines;
-            this.importTrampolines = importTrampolines;
-            this.trampolineStubTramp = trampolineStubTramp;
-            this.memGrowStubTramp = memGrowStubTramp;
-            this.memmoveTramp = memmoveTramp;
-            this.memsetTramp = memsetTramp;
-        }
-
-        public Map<FunctionType, byte[]> entryTrampolines() {
-            return entryTrampolines;
-        }
-
-        public byte[][] importTrampolines() {
-            return importTrampolines;
-        }
-
-        public byte[] trampolineStubTramp() {
-            return trampolineStubTramp;
-        }
-
-        public byte[] memGrowStubTramp() {
-            return memGrowStubTramp;
-        }
-
-        public byte[] memmoveTramp() {
-            return memmoveTramp;
-        }
-
-        public byte[] memsetTramp() {
-            return memsetTramp;
-        }
-
-        public long totalSize() {
-            long size = 0;
-            for (byte[] code : entryTrampolines.values()) {
-                size += align(code.length, 16);
-            }
-            for (byte[] code : importTrampolines) {
-                size += align(code.length, 16);
-            }
-            size += align(trampolineStubTramp.length, 16);
-            size += align(memGrowStubTramp.length, 16);
-            size += align(memmoveTramp.length, 16);
-            size += align(memsetTramp.length, 16);
-            return size;
-        }
-    }
-
-    public CompiledTrampolines compileTrampolines(
-            byte[][] compiledCode,
-            FunctionType[] funcTypesByBody,
-            FunctionType[] importTypes,
-            long[] importStubAddrs,
-            long trampolineStubAddr,
-            long memGrowStubAddr,
-            long memmoveAddr,
-            long memsetAddr) {
-
-        Map<FunctionType, byte[]> entryTrampolineCode = new HashMap<>();
-        for (int i = 0; i < compiledCode.length; i++) {
-            if (compiledCode[i] != null && !entryTrampolineCode.containsKey(funcTypesByBody[i])) {
-                entryTrampolineCode.put(
-                        funcTypesByBody[i], compileEntryTrampoline(funcTypesByBody[i]));
-            }
-        }
-
-        byte[][] importTrampolineCode = new byte[importTypes.length][];
-        for (int i = 0; i < importTypes.length; i++) {
-            importTrampolineCode[i] = compileImportTrampoline(importTypes[i], importStubAddrs[i]);
-        }
-
-        int[] i64Param = {TYPE_I64};
-        int[] i64Return = {TYPE_I64};
-        int[] i64x3Param = {TYPE_I64, TYPE_I64, TYPE_I64};
-
-        return new CompiledTrampolines(
-                entryTrampolineCode,
-                importTrampolineCode,
-                compileStubTrampoline(trampolineStubAddr, i64Param, i64Return),
-                compileStubTrampoline(memGrowStubAddr, i64Param, i64Return),
-                compileStubTrampoline(memmoveAddr, i64x3Param, i64Return),
-                compileStubTrampoline(memsetAddr, i64x3Param, i64Return));
-    }
-
-    public static long align(long value, long alignment) {
-        return (value + alignment - 1) & ~(alignment - 1);
+    /** The code produced by the last function or trampoline compilation. */
+    public byte[] compiledCode() {
+        return exports.memory().readBytes(exports.getCodePtr(), exports.getCodeLen());
     }
 }

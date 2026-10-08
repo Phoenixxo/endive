@@ -17,10 +17,8 @@ public final class NativeInstanceBuilder {
 
     public static NativeInstanceBuilder builder(WasmModule module) {
         var b = JffiNativeMachineFactory.builder(module);
-        b.withCompilerFunction(
-                m ->
-                        NativeCompiler.compileAll(
-                                RedlineTarget.detectHost().orElseThrow().triple(), m));
+        b.withPrecompiledCode(
+                NativeCompiler.compile(RedlineTarget.detectHost().orElseThrow().triple(), module));
         return new NativeInstanceBuilder(b);
     }
 

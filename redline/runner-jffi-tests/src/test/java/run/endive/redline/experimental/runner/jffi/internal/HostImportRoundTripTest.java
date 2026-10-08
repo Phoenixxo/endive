@@ -106,10 +106,9 @@ public class HostImportRoundTripTest {
 
         return JffiNativeMachineFactory.builder(module)
                 .withImportValues(imports)
-                .withCompilerFunction(
-                        m ->
-                                NativeCompiler.compileAll(
-                                        RedlineTarget.detectHost().orElseThrow().triple(), m))
+                .withPrecompiledCode(
+                        NativeCompiler.compile(
+                                RedlineTarget.detectHost().orElseThrow().triple(), module))
                 .build();
     }
 }

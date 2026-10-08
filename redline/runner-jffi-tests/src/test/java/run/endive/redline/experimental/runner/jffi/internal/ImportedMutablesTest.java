@@ -140,12 +140,12 @@ public class ImportedMutablesTest {
 
     private static run.endive.runtime.Instance build(
             Memory memory, TableInstance table, GlobalInstance counter) {
-        return JffiNativeMachineFactory.builder(module())
+        var module = module();
+        return JffiNativeMachineFactory.builder(module)
                 .withImportValues(importsFor(memory, table, counter))
-                .withCompilerFunction(
-                        m ->
-                                NativeCompiler.compileAll(
-                                        RedlineTarget.detectHost().orElseThrow().triple(), m))
+                .withPrecompiledCode(
+                        NativeCompiler.compile(
+                                RedlineTarget.detectHost().orElseThrow().triple(), module))
                 .build();
     }
 }

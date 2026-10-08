@@ -1,15 +1,19 @@
 package run.endive.redline.experimental.compiler.internal;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.api.internal.CtxBuffer;
 import run.endive.redline.experimental.api.internal.TypeMapUtils;
 import run.endive.redline.experimental.bridge.internal.CraneliftBridge;
@@ -18,6 +22,7 @@ import run.endive.wasm.WasmModule;
 import run.endive.wasm.types.AnnotatedInstruction;
 import run.endive.wasm.types.BlockType;
 import run.endive.wasm.types.ExternalType;
+import run.endive.wasm.types.FunctionImport;
 import run.endive.wasm.types.FunctionType;
 import run.endive.wasm.types.OpCode;
 import run.endive.wasm.types.ValType;
@@ -103,8 +108,83 @@ public final class NativeCompiler {
 
     private static final ExecutorService POOL = Executors.newFixedThreadPool(THREAD_COUNT);
 
-    public static byte[][] compileAll(String triple, WasmModule module) {
-        return new NativeCompiler(null, triple, module).compileAll((boolean[]) null);
+    private static final int CODE_ALIGNMENT = 16;
+
+    /** Compiles every function body, and the trampolines linking them to the host. */
+    public static NativeCode compile(String triple, WasmModule module) {
+        var compiler = new NativeCompiler(null, triple, module);
+        return compiler.link(compiler.compileAll((boolean[]) null));
+    }
+
+    private NativeCode link(byte[][] bodies) {
+        var image = new ByteArrayOutputStream();
+        int[] bodyOffsets = new int[bodies.length];
+        int[] entryTrampolineOffsets = new int[bodies.length];
+        int[] importTrampolineOffsets = new int[numImports];
+        int[] importStubSlotOffsets = new int[numImports];
+        Arrays.fill(bodyOffsets, NativeCode.NOT_COMPILED);
+        Arrays.fill(entryTrampolineOffsets, NativeCode.NOT_COMPILED);
+
+        for (int i = 0; i < bodies.length; i++) {
+            if (bodies[i] != null) {
+                bodyOffsets[i] = append(image, bodies[i]);
+            }
+        }
+
+        try (var trampolineBridge = new CraneliftBridge()) {
+            trampolineBridge.init(triple);
+            var trampolines = new TrampolineCompiler(trampolineBridge);
+
+            Map<FunctionType, Integer> entryTrampolineByType = new HashMap<>();
+            for (int i = 0; i < bodies.length; i++) {
+                if (bodies[i] != null) {
+                    var funcType =
+                            (FunctionType)
+                                    module.typeSection()
+                                            .getType(module.functionSection().getFunctionType(i));
+                    entryTrampolineOffsets[i] =
+                            entryTrampolineByType.computeIfAbsent(
+                                    funcType, t -> append(image, trampolines.entry(t)));
+                }
+            }
+
+            // Each import gets its own copy, as each is linked to a different stub
+            Map<FunctionType, TrampolineCompiler.ImportTrampoline> importTrampolineByType =
+                    new HashMap<>();
+            int funcId = 0;
+            for (int i = 0; i < module.importSection().importCount(); i++) {
+                var imp = module.importSection().getImport(i);
+                if (imp.importType() == ExternalType.FUNCTION) {
+                    var funcType =
+                            (FunctionType)
+                                    module.typeSection()
+                                            .getType(((FunctionImport) imp).typeIndex());
+                    var trampoline =
+                            importTrampolineByType.computeIfAbsent(
+                                    funcType, trampolines::importCall);
+                    importTrampolineOffsets[funcId] = append(image, trampoline.code);
+                    importStubSlotOffsets[funcId] =
+                            importTrampolineOffsets[funcId] + trampoline.stubSlotOffset;
+                    funcId++;
+                }
+            }
+        }
+
+        return new NativeCode(
+                triple,
+                image.toByteArray(),
+                bodyOffsets,
+                entryTrampolineOffsets,
+                importTrampolineOffsets,
+                importStubSlotOffsets);
+    }
+
+    private static int append(ByteArrayOutputStream image, byte[] code) {
+        int offset = image.size();
+        image.write(code, 0, code.length);
+        int padding = -image.size() & (CODE_ALIGNMENT - 1);
+        image.write(new byte[padding], 0, padding);
+        return offset;
     }
 
     /**

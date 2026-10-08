@@ -4,7 +4,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
+import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.runner.internal.NativeGlobalInstance;
 import run.endive.redline.experimental.runner.internal.NativeMachine;
 import run.endive.redline.experimental.runner.internal.NativeMemory;
@@ -25,20 +25,15 @@ public final class NativeMachineFactory {
 
     private final Arena arena = Arena.ofShared();
     private final WasmModule module;
-    private final byte[][] precompiledCode;
-    private final Function<WasmModule, byte[][]> compilerFunction;
+    private final NativeCode precompiledCode;
     private final List<NativeTable> nativeTables = new ArrayList<>();
     private MemorySegment globalsBuffer;
     private int globalIndex;
     private NativeMachine nativeMachine;
 
-    private NativeMachineFactory(
-            WasmModule module,
-            byte[][] precompiledCode,
-            Function<WasmModule, byte[][]> compilerFunction) {
+    private NativeMachineFactory(WasmModule module, NativeCode precompiledCode) {
         this.module = module;
         this.precompiledCode = precompiledCode;
-        this.compilerFunction = compilerFunction;
 
         int importGlobalCount =
                 (int)
@@ -98,21 +93,14 @@ public final class NativeMachineFactory {
         this.globalIndex = importGlobalCount;
         this.nativeTables.clear();
         this.nativeMachine =
-                new NativeMachine(
-                        instance,
-                        arena,
-                        nativeTables,
-                        globalsBuffer,
-                        precompiledCode,
-                        compilerFunction);
+                new NativeMachine(instance, arena, nativeTables, globalsBuffer, precompiledCode);
         return nativeMachine;
     }
 
     public static final class Builder {
 
         private final WasmModule module;
-        private byte[][] precompiledCode;
-        private Function<WasmModule, byte[][]> compilerFunction;
+        private NativeCode precompiledCode;
         private ImportValues importValues;
         private MemoryLimits memoryLimits;
         private boolean start = true;
@@ -122,13 +110,8 @@ public final class NativeMachineFactory {
             this.module = module;
         }
 
-        public Builder withPrecompiledCode(byte[][] precompiledCode) {
+        public Builder withPrecompiledCode(NativeCode precompiledCode) {
             this.precompiledCode = precompiledCode;
-            return this;
-        }
-
-        public Builder withCompilerFunction(Function<WasmModule, byte[][]> compilerFunction) {
-            this.compilerFunction = compilerFunction;
             return this;
         }
 
@@ -153,7 +136,7 @@ public final class NativeMachineFactory {
         }
 
         public Instance.Builder toInstanceBuilder() {
-            var factory = new NativeMachineFactory(module, precompiledCode, compilerFunction);
+            var factory = new NativeMachineFactory(module, precompiledCode);
             return Instance.builder(module)
                     .withMachineFactory(factory::compile)
                     .withTableFactory(factory::createTable)
