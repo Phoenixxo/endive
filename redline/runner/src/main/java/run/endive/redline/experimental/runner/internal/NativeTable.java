@@ -5,6 +5,7 @@ import static run.endive.wasm.types.Value.REF_NULL_VALUE;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
 import run.endive.redline.experimental.api.internal.CtxBuffer;
 import run.endive.runtime.Instance;
 import run.endive.runtime.TableInstance;
@@ -19,14 +20,21 @@ import run.endive.wasm.types.ValType;
  *
  * <p>Layout: [size:i32 @ 0][max:i32 @ 4][entries... @ 8]
  *
- * <p>Each entry is 16 bytes:
+ * <p>Each entry is 24 bytes:
  * <pre>
  *   [0..4)   i32  canonicalTypeIdx
  *   [4..8)   i32  funcId
  *   [8..16)  i64  funcPtr (native address)
+ *   [16..24) i64  ownerCtx (context of the native instance defining the function)
  * </pre>
  *
- * <p>NULL entry: funcId == REF_NULL_VALUE (-1), funcPtr == 0, typeIdx == 0.
+ * <p>NULL entry: funcId == REF_NULL_VALUE (-1), funcPtr == 0, typeIdx == 0, ownerCtx == 0.
+ *
+ * <p>The type index, function id and pointer are the owning instance's,
+ * which is not necessarily an instance that uses the table.
+ * Native code calls an entry directly only from the owner's context.
+ * An entry whose function is defined by an instance without native code has no pointer
+ * and no owner context; its owner is kept here instead.
  *
  * <p>The entries array is pre-allocated to the table's max capacity so that
  * {@code TABLE.GROW} only bumps the size field without reallocation.
@@ -44,6 +52,13 @@ public final class NativeTable extends TableInstance {
     private final MemorySegment buffer;
     private final int capacity;
     private final boolean isExternRef;
+
+    /**
+     * The instance that wrote each entry from Java, for entries without an owner context:
+     * one not yet resolved, or one owned by an instance without native code.
+     * Grows with the table rather than to its capacity.
+     */
+    private Instance[] owners = new Instance[0];
 
     public NativeTable(Table table, int initValue, Arena arena) {
         super(table, initValue);
@@ -71,7 +86,7 @@ public final class NativeTable extends TableInstance {
             // The instance has no machine yet, so funcPtr cannot be resolved
             // here. resolvePendingRefs fills it in once there is one.
             for (int i = 0; i < initial; i++) {
-                writeUnresolvedEntry(i, initValue);
+                writeUnresolvedEntry(i, initValue, null);
             }
         }
     }
@@ -81,23 +96,32 @@ public final class NativeTable extends TableInstance {
     }
 
     private void writeNullEntry(int index) {
-        long base = entryBase(index);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, 0);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, REF_NULL_VALUE);
-        buffer.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, 0L);
-    }
-
-    /** A funcref whose native address is not known yet. */
-    private void writeUnresolvedEntry(int index, int value) {
-        long base = entryBase(index);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, 0);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, value);
-        buffer.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, 0L);
+        writeEntry(index, 0, REF_NULL_VALUE, 0L, 0L);
     }
 
     /**
-     * Fills in the native address of entries written before the instance had a
-     * machine, which is the case for a table initialiser.
+     * A funcref with no native address: not resolved yet,
+     * or defined by an instance without native code.
+     * Either way {@code owner} is the instance it names a function of.
+     */
+    private void writeUnresolvedEntry(int index, int value, Instance owner) {
+        writeEntry(index, 0, value, 0L, 0L);
+        setOwner(index, owner);
+    }
+
+    private void writeEntry(int index, int typeIdx, int funcId, long funcPtr, long ownerCtx) {
+        long base = entryBase(index);
+        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, typeIdx);
+        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, funcId);
+        buffer.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, funcPtr);
+        buffer.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_OWNER_CTX_OFFSET, ownerCtx);
+    }
+
+    /**
+     * Fills in the native address of entries written before their instance had a machine,
+     * which is the case for a table initialiser.
+     * An entry is resolved against the instance that wrote it,
+     * or {@code instance} when nothing recorded one.
      */
     void resolvePendingRefs(Instance instance) {
         if (isExternRef) {
@@ -110,42 +134,68 @@ public final class NativeTable extends TableInstance {
             long funcPtr =
                     buffer.get(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET);
             if (funcId != REF_NULL_VALUE && funcPtr == 0L) {
-                resolveFromInstance(i, funcId, instance);
+                Instance owner = recordedOwner(i);
+                resolveFromInstance(i, funcId, owner != null ? owner : instance);
             }
         }
     }
 
-    private void writeOpaqueEntry(int index, int value) {
-        long base = entryBase(index);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, 0);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, value);
-        buffer.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, 0L);
-    }
-
-    private void writeResolvedEntry(int index, int funcId, MemorySegment ft, MemorySegment fta) {
-        long base = entryBase(index);
-        long funcPtr = ft.get(ValueLayout.JAVA_LONG, (long) funcId * 8);
-        int typeIdx = fta.get(ValueLayout.JAVA_INT, (long) funcId * 4);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, typeIdx);
-        buffer.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, funcId);
-        buffer.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, funcPtr);
+    private void writeResolvedEntry(int index, int funcId, NativeMachine owner) {
+        long funcPtr = owner.getFuncTable().get(ValueLayout.JAVA_LONG, (long) funcId * 8);
+        int typeIdx = owner.getFuncTypesArray().get(ValueLayout.JAVA_INT, (long) funcId * 4);
+        writeEntry(index, typeIdx, funcId, funcPtr, owner.contextAddress());
     }
 
     /**
-     * Try to resolve funcId → funcPtr+typeIdx using the instance's NativeMachine.
-     * For externref tables, stores the value as-is without function resolution.
-     * Returns true if resolved, false if not (instance is null or not NativeMachine).
+     * Writes {@code funcId} as a function of {@code instance}.
+     * With native code it gets that instance's address and context.
+     * Without, or before it has a machine,
+     * it is left for {@link #resolvePendingRefs} or a call through the runner.
      */
-    private boolean resolveFromInstance(int index, int funcId, Instance instance) {
+    private void resolveFromInstance(int index, int funcId, Instance instance) {
         if (isExternRef) {
-            writeOpaqueEntry(index, funcId);
-            return true;
+            writeEntry(index, 0, funcId, 0L, 0L);
+        } else if (instance != null && instance.getMachine() instanceof NativeMachine nm) {
+            writeResolvedEntry(index, funcId, nm);
+        } else {
+            writeUnresolvedEntry(index, funcId, instance);
         }
-        if (instance != null && instance.getMachine() instanceof NativeMachine nm) {
-            writeResolvedEntry(index, funcId, nm.getFuncTable(), nm.getFuncTypesArray());
-            return true;
+    }
+
+    private Instance recordedOwner(int index) {
+        return index < owners.length ? owners[index] : null;
+    }
+
+    private void setOwner(int index, Instance owner) {
+        if (index >= owners.length) {
+            if (owner == null) {
+                return;
+            }
+            owners =
+                    Arrays.copyOf(owners, Math.max(index + 1, Math.max(size(), owners.length * 2)));
         }
-        return false;
+        owners[index] = owner;
+    }
+
+    /** The context of the instance owning entry {@code index}, or 0 when it has none. */
+    long ownerContext(int index) {
+        return buffer.get(
+                ValueLayout.JAVA_LONG, entryBase(index) + CtxBuffer.ENTRY_OWNER_CTX_OFFSET);
+    }
+
+    /**
+     * Copies what this table keeps outside native memory for {@code count} entries,
+     * after native code copied the entries themselves.
+     * Overlapping ranges are handled.
+     */
+    void copyOwnersFrom(NativeTable src, int srcIndex, int dstIndex, int count) {
+        Instance[] from = new Instance[count];
+        for (int i = 0; i < count; i++) {
+            from[i] = src.recordedOwner(srcIndex + i);
+        }
+        for (int i = 0; i < count; i++) {
+            setOwner(dstIndex + i, from[i]);
+        }
     }
 
     /** Get the native address of the table buffer, for passing to native code. */
@@ -197,8 +247,8 @@ public final class NativeTable extends TableInstance {
         }
         if (value == REF_NULL_VALUE) {
             writeNullEntry(index);
-        } else if (!resolveFromInstance(index, value, instance)) {
-            writeUnresolvedEntry(index, value);
+        } else {
+            resolveFromInstance(index, value, instance);
         }
     }
 
@@ -214,8 +264,8 @@ public final class NativeTable extends TableInstance {
         for (int i = oldSize; i < newSize; i++) {
             if (value == REF_NULL_VALUE) {
                 writeNullEntry(i);
-            } else if (!resolveFromInstance(i, value, instance)) {
-                writeUnresolvedEntry(i, value);
+            } else {
+                resolveFromInstance(i, value, instance);
             }
         }
         // Update size
@@ -224,10 +274,21 @@ public final class NativeTable extends TableInstance {
         return oldSize;
     }
 
+    /**
+     * The instance whose function entry {@code index} holds, or {@code null} for a null entry,
+     * or one whose owner was never known.
+     */
     @Override
     public Instance instance(int index) {
-        // Single-module assumption — all entries belong to the same instance
-        return null;
+        if (index < 0 || index >= size() || isExternRef || ref(index) == REF_NULL_VALUE) {
+            return null;
+        }
+        long ctx = ownerContext(index);
+        if (ctx != 0L) {
+            NativeMachine owner = NativeMachine.forContext(ctx);
+            return owner != null ? owner.instance() : null;
+        }
+        return recordedOwner(index);
     }
 
     @Override

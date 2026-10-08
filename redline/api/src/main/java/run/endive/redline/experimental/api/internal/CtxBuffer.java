@@ -9,9 +9,9 @@ package run.endive.redline.experimental.api.internal;
  *   0     i64    funcTablePtr      Pointer to function pointer table
  *   8     i64    trampolinePtr     Upcall stub for CALL_INDIRECT fallback
  *  16     i32    trapCode          Trap code written by native pre-checks
- *  20     i32    typeId            CALL_INDIRECT: expected type index
- *  24     i32    tableIdx          CALL_INDIRECT: table index
- *  28     i32    elemIdx           CALL_INDIRECT: table element index
+ *  20     i32    typeId            CALL_INDIRECT to another instance: expected type index
+ *  24     i32    tableIdx          CALL_INDIRECT to another instance: table index
+ *  28     i32    elemIdx           CALL_INDIRECT to another instance: table element index
  *  32     i32    argCount          Number of call arguments
  *  36     i32    memGrowDelta      Page count delta for memory.grow
  *  40     i64    argsPtr           Pointer to separate args buffer
@@ -82,10 +82,18 @@ public final class CtxBuffer {
     public static final int TABLE_SIZE_OFFSET = 0;
     public static final int TABLE_MAX_OFFSET = 4;
     public static final int TABLE_ENTRIES_OFFSET = 8;
-    public static final int TABLE_ENTRY_SIZE = 16;
+    public static final int TABLE_ENTRY_SIZE = 24;
     public static final int ENTRY_TYPE_IDX_OFFSET = 0;
     public static final int ENTRY_FUNC_ID_OFFSET = 4;
     public static final int ENTRY_FUNC_PTR_OFFSET = 8;
+
+    /**
+     * The context of the instance that defines the entry's function,
+     * or 0 when that instance has no native context.
+     * The entry's type index and function pointer only mean something to that instance,
+     * so a call from any other context goes through the runner instead.
+     */
+    public static final int ENTRY_OWNER_CTX_OFFSET = 16;
 
     public static int argOffset(int i) {
         return 8 * i;
