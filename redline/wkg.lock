@@ -9,14 +9,9 @@ registry = "ghcr.io"
 [[packages.versions]]
 requirement = "=999.0.0-SNAPSHOT"
 version = "999.0.0-SNAPSHOT"
-digest = "sha256:f8c8b2d7c30646e0f3bae4c643ec3878bb505258fa75dd8e894b092595179e67"
+digest = "sha256:38aa5240bef7632b97a39bf591b714802959964e9527ab218295907cea15b87f"
 
 [[packages.versions]]
 requirement = "=1.1.0"
 version = "1.1.0"
 digest = "sha256:f8c8b2d7c30646e0f3bae4c643ec3878bb505258fa75dd8e894b092595179e67"
-
-[[packages.versions]]
-requirement = "=999.0.0-redline-202"
-version = "999.0.0-redline-202"
-digest = "sha256:166b9828c619d834d66a49c73063ebbb8bdef2d94464b15f7eefc6a72e036ce5"
