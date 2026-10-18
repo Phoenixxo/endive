@@ -10,6 +10,8 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.ref.Reference;
 import java.util.ArrayList;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.api.internal.CtxBuffer;
 import run.endive.redline.experimental.api.internal.InterruptWatchdog;
@@ -43,6 +45,13 @@ public final class NativeMachine implements Machine {
 
     private static final int CTX_SIZE = CtxBuffer.CTX_SIZE;
     private static final long PAGE_SIZE = 4096;
+
+    /**
+     * Open machines by context address. A table entry names its owner by
+     * context, so this is how a foreign entry, or {@link NativeTable#instance},
+     * finds the owning machine.
+     */
+    private static final Map<Long, NativeMachine> BY_CONTEXT = new ConcurrentHashMap<>();
 
     // Conversion handles for adapting downcalls to uniform (MS, MS, long[]) → long.
     // These use Wasm bit-reinterpretation (not numeric casts).
@@ -238,6 +247,32 @@ public final class NativeMachine implements Machine {
         // An imported memory outlives this instance and may back others, so only
         // a memory this module defines is ours to close.
         this.ownsMemory = instance.imports().memoryCount() == 0;
+        BY_CONTEXT.put(ctxBuffer.address(), this);
+    }
+
+    /**
+     * Returns the open machine whose context is at {@code address}.
+     *
+     * @param address a context address, as recorded in a table entry
+     * @return the machine, or {@code null} if none is open there
+     */
+    static NativeMachine forContext(long address) {
+        return BY_CONTEXT.get(address);
+    }
+
+    /**
+     * Returns the address of this machine's context, which the table entries it
+     * writes record as their owner.
+     *
+     * @return the context address
+     */
+    long contextAddress() {
+        return ctxBuffer.address();
+    }
+
+    /** Returns the instance this machine executes. */
+    Instance instance() {
+        return instance;
     }
 
     @Override
@@ -248,6 +283,7 @@ public final class NativeMachine implements Machine {
             return;
         }
         closed = true;
+        BY_CONTEXT.remove(ctxBuffer.address(), this);
         if (nativeMemory != null && ownsMemory) {
             nativeMemory.close();
         }
@@ -512,10 +548,12 @@ public final class NativeMachine implements Machine {
     }
 
     /**
-     * Compiled code only reaches this with a table operation sentinel: it emits
-     * call_indirect inline and never writes TYPE_ID, TABLE_IDX or ELEM_IDX, so the
-     * call_indirect path this used to carry could only ever have dispatched on
-     * whatever those fields happened to hold.
+     * Entry point for compiled code that needs the runner: table operations,
+     * flagged by a negative argument count, and call_indirect through an entry
+     * another instance owns.
+     *
+     * @param ctxAddr the calling function's context
+     * @return the operation's result, or 0 if it recorded an exception
      */
     @SuppressWarnings("unused")
     private long callIndirectTrampoline(long ctxAddr) {
@@ -525,11 +563,56 @@ public final class NativeMachine implements Machine {
             if (argCount < 0) {
                 return handleTableOperation(argCount);
             }
-            throw new WasmEngineException("Unexpected trampoline call: argCount " + argCount);
+            return callForeignEntry(
+                    ctx.get(ValueLayout.JAVA_INT, CtxBuffer.TYPE_ID),
+                    ctx.get(ValueLayout.JAVA_INT, CtxBuffer.TABLE_IDX),
+                    ctx.get(ValueLayout.JAVA_INT, CtxBuffer.ELEM_IDX),
+                    argCount);
         } catch (Throwable t) {
             recordHostException(t);
             return 0L;
         }
+    }
+
+    /**
+     * Calls a table entry this instance does not own, in the instance that
+     * does. Compiled code has already checked the index and that the entry is
+     * not null. The entry's type index is the owner's, so the signature is
+     * checked here by structure. The call runs through the owner's machine,
+     * against the owner's memory, globals and tables. A trap there becomes an
+     * exception that unwinds this instance too.
+     *
+     * @param typeId the expected type, in this module's index space
+     * @param tableIdx the table, in this module's index space
+     * @param elemIdx the entry
+     * @param argCount the number of arguments in argsBuffer
+     * @return a single result as raw bits, or 0 with the results left in
+     *     argsBuffer for a multi-value call
+     */
+    private long callForeignEntry(int typeId, int tableIdx, int elemIdx, int argCount) {
+        NativeTable table = nativeTables[tableIdx];
+        int funcId = table.ref(elemIdx);
+        Instance owner = table.instance(elemIdx);
+        if (owner == null || owner.getMachine() == null) {
+            throw new TrapException("uninitialized element");
+        }
+        var expected = (FunctionType) instance.module().typeSection().getType(typeId);
+        var actual = owner.type(owner.functionType(funcId));
+        if (!expected.equals(actual)) {
+            throw new TrapException("indirect call type mismatch");
+        }
+        long[] args = new long[argCount];
+        for (int i = 0; i < argCount; i++) {
+            args[i] = argsBuffer.get(ValueLayout.JAVA_LONG, CtxBuffer.argOffset(i));
+        }
+        long[] results = owner.getMachine().call(funcId, args);
+        if (expected.returns().size() > 1) {
+            for (int i = 0; i < results.length; i++) {
+                argsBuffer.set(ValueLayout.JAVA_LONG, CtxBuffer.argOffset(i), results[i]);
+            }
+            return 0L;
+        }
+        return results == null || results.length == 0 ? 0L : results[0];
     }
 
     private long handleTableOperation(int opCode) {
@@ -568,7 +651,7 @@ public final class NativeMachine implements Machine {
                     writeTableEntry(tableBuf, i, fillValue, externRef);
                 }
             }
-            case -3 -> { // table copy (16-byte entries)
+            case -3 -> { // table copy
                 long srcAddr = argsBuffer.get(ValueLayout.JAVA_LONG, CtxBuffer.argOffset(0));
                 long dstAddr = argsBuffer.get(ValueLayout.JAVA_LONG, CtxBuffer.argOffset(1));
                 int srcOff = (int) argsBuffer.get(ValueLayout.JAVA_LONG, CtxBuffer.argOffset(2));
@@ -585,7 +668,7 @@ public final class NativeMachine implements Machine {
                                 .reinterpret(
                                         CtxBuffer.TABLE_ENTRIES_OFFSET
                                                 + (long) (dstOff + size) * entrySize);
-                // Copy 16-byte entries with correct overlap handling
+                // Copy entries with correct overlap handling
                 if (dstOff <= srcOff) {
                     for (int i = 0; i < size; i++) {
                         copyTableEntry(srcBuf, srcOff + i, dstBuf, dstOff + i);
@@ -594,6 +677,11 @@ public final class NativeMachine implements Machine {
                     for (int i = size - 1; i >= 0; i--) {
                         copyTableEntry(srcBuf, srcOff + i, dstBuf, dstOff + i);
                     }
+                }
+                NativeTable src = tableAt(srcAddr);
+                NativeTable dst = tableAt(dstAddr);
+                if (src != null && dst != null) {
+                    dst.copyOwnersFrom(src, srcOff, dstOff, size);
                 }
             }
             case -4 -> { // table init
@@ -667,20 +755,36 @@ public final class NativeMachine implements Machine {
             tableBuf.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, typeIdx);
             tableBuf.set(ValueLayout.JAVA_INT, base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, funcId);
             tableBuf.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, funcPtr);
+            tableBuf.set(
+                    ValueLayout.JAVA_LONG,
+                    base + CtxBuffer.ENTRY_OWNER_CTX_OFFSET,
+                    ctxBuffer.address());
+            return;
         }
+        tableBuf.set(ValueLayout.JAVA_LONG, base + CtxBuffer.ENTRY_OWNER_CTX_OFFSET, 0L);
     }
 
-    /** Copy a single 16-byte table entry from src[srcIdx] to dst[dstIdx]. */
+    /** Copy a single table entry from src[srcIdx] to dst[dstIdx]. */
     private static void copyTableEntry(
             MemorySegment src, int srcIdx, MemorySegment dst, int dstIdx) {
         long srcBase = CtxBuffer.TABLE_ENTRIES_OFFSET + (long) srcIdx * CtxBuffer.TABLE_ENTRY_SIZE;
         long dstBase = CtxBuffer.TABLE_ENTRIES_OFFSET + (long) dstIdx * CtxBuffer.TABLE_ENTRY_SIZE;
-        int typeIdx = src.get(ValueLayout.JAVA_INT, srcBase + CtxBuffer.ENTRY_TYPE_IDX_OFFSET);
-        int funcId = src.get(ValueLayout.JAVA_INT, srcBase + CtxBuffer.ENTRY_FUNC_ID_OFFSET);
-        long funcPtr = src.get(ValueLayout.JAVA_LONG, srcBase + CtxBuffer.ENTRY_FUNC_PTR_OFFSET);
-        dst.set(ValueLayout.JAVA_INT, dstBase + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, typeIdx);
-        dst.set(ValueLayout.JAVA_INT, dstBase + CtxBuffer.ENTRY_FUNC_ID_OFFSET, funcId);
-        dst.set(ValueLayout.JAVA_LONG, dstBase + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, funcPtr);
+        MemorySegment.copy(src, srcBase, dst, dstBase, CtxBuffer.TABLE_ENTRY_SIZE);
+    }
+
+    /**
+     * Finds this instance's table whose native buffer is at {@code address}.
+     *
+     * @param address a table buffer address
+     * @return the table, or {@code null} if this instance has none there
+     */
+    private NativeTable tableAt(long address) {
+        for (NativeTable table : nativeTables) {
+            if (table.nativeBuffer().address() == address) {
+                return table;
+            }
+        }
+        return null;
     }
 
     // --- Memory grow upcall stub ---
