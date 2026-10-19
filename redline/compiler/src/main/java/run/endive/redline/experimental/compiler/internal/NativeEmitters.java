@@ -846,22 +846,7 @@ final class NativeEmitters {
         // 3. Calculate entry offset: elemIdx * TABLE_ENTRY_SIZE
         int entryOffset = b.emitImul(elemIdx, b.emitIconst32(CtxBuffer.TABLE_ENTRY_SIZE));
 
-        // 4. Null check: funcId == REF_NULL → trap "uninitialized element".
-        //    Checked on funcId, since an entry owned by another instance may
-        //    have no funcPtr.
-        int funcId =
-                b.emitLoadI32(
-                        tablePtr,
-                        entryOffset,
-                        CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_FUNC_ID_OFFSET);
-        int isNull = b.emitIcmp(0, funcId, b.emitIconst32(-1)); // EQ
-        int trapNullBlock = b.createBlock();
-        int afterNullBlock = b.createBlock();
-        b.emitBrif(isNull, trapNullBlock, afterNullBlock);
-        fillTrapBlock(ctx, trapNullBlock, CtxBuffer.TRAP_UNINITIALIZED_ELEMENT);
-        b.switchToBlock(afterNullBlock);
-
-        // 5. Write args to argsBuffer (read by import stubs, and by the runner
+        // 4. Write args to argsBuffer (read by import stubs, and by the runner
         //    for a foreign entry)
         int argsPtr = b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.ARGS_PTR);
         b.emitStoreI32(
@@ -871,14 +856,14 @@ final class NativeEmitters {
             b.emitStoreI64(argsPtr, zero, widened, CtxBuffer.argOffset(i));
         }
 
-        // 6. Ownership check: entry.ownerCtx == ctxPtr → call directly, else
-        //    via runner
-        int ownerCtx =
+        // 5. Call an entry this instance owns directly; any other, null included, via the runner
+        int ownerId =
                 b.emitLoadI64(
                         tablePtr,
                         entryOffset,
-                        CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_OWNER_CTX_OFFSET);
-        int isLocal = b.emitIcmp(0, ownerCtx, b.useVar(ctx.ctxPtrVar)); // EQ
+                        CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_OWNER_ID_OFFSET);
+        int selfId = b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.OWNER_ID);
+        int isLocal = b.emitIcmp(0, ownerId, selfId); // EQ
 
         boolean calleeMultiReturn = targetType.returns().size() > 1;
         boolean singleReturn = targetType.returns().size() == 1;
@@ -893,7 +878,7 @@ final class NativeEmitters {
                         : -1;
         b.emitBrif(isLocal, localBlock, foreignBlock);
 
-        // 7. Local entry: type check against the canonical type, then call
+        // 6. Local entry: type check against the canonical type, then call
         //    funcPtr
         b.switchToBlock(localBlock);
         int actualType =
@@ -915,6 +900,13 @@ final class NativeEmitters {
                         tablePtr,
                         entryOffset,
                         CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_FUNC_PTR_OFFSET);
+        // A function the image left uncompiled has no address
+        int noCode = b.emitIcmp(0, funcPtr, b.emitIconst64(0, 0)); // EQ
+        int trapNoCodeBlock = b.createBlock();
+        int afterNoCodeBlock = b.createBlock();
+        b.emitBrif(noCode, trapNoCodeBlock, afterNoCodeBlock);
+        fillTrapBlock(ctx, trapNoCodeBlock, CtxBuffer.TRAP_UNINITIALIZED_ELEMENT);
+        b.switchToBlock(afterNoCodeBlock);
         int sigRef =
                 calleeMultiReturn
                         ? ctx.getOrCreateMultiReturnSigRef(targetType)
@@ -935,7 +927,7 @@ final class NativeEmitters {
             }
         }
 
-        // 8. Foreign entry: the runner checks the type and calls the owning
+        // 7. Foreign entry: the runner checks the type and calls the owning
         //    instance. A single result comes back as raw bits, several are left
         //    in argsBuffer.
         b.switchToBlock(foreignBlock);
@@ -946,6 +938,7 @@ final class NativeEmitters {
         int trampolinePtr = b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.TRAMPOLINE_PTR);
         b.pushCallArg(b.useVar(ctx.ctxPtrVar));
         int raw = b.emitCallIndirect(ctx.getOrCreateTrampolineSigRef(), trampolinePtr);
+        // Not a real tail call: a chain of them across instances grows the stack
         if (tail) {
             emitTrapCheck(ctx);
             if (singleReturn) {
@@ -966,7 +959,7 @@ final class NativeEmitters {
             b.emitJump(mergeBlock);
         }
 
-        // 9. Handle results
+        // 8. Handle results
         b.switchToBlock(mergeBlock);
         emitTrapCheck(ctx);
         if (calleeMultiReturn) {
@@ -1125,7 +1118,7 @@ final class NativeEmitters {
         int entryTypeOff = CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_TYPE_IDX_OFFSET;
         int entryFuncIdOff = CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_FUNC_ID_OFFSET;
         int entryFuncPtrOff = CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_FUNC_PTR_OFFSET;
-        int entryOwnerOff = CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_OWNER_CTX_OFFSET;
+        int entryOwnerOff = CtxBuffer.TABLE_ENTRIES_OFFSET + CtxBuffer.ENTRY_OWNER_ID_OFFSET;
 
         // Check if value is REF_NULL (-1)
         int refNull = b.emitIconst32(-1);
@@ -1153,7 +1146,8 @@ final class NativeEmitters {
             b.emitStoreI64(tablePtr, entryOffset, b.emitIconst64(0, 0), entryFuncPtrOff);
             b.emitStoreI64(tablePtr, entryOffset, b.emitIconst64(0, 0), entryOwnerOff);
         } else {
-            // FuncRef: resolve funcId → funcPtr+typeIdx
+            // A funcref value carries no owner, so it is taken to be this instance's
+            emitRegisterTableWriter(ctx, tableIdx);
             int funcTablePtr =
                     b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.FUNC_TABLE_PTR);
             int funcPtrOffset = b.emitImul(funcId, b.emitIconst32(8));
@@ -1165,12 +1159,41 @@ final class NativeEmitters {
             b.emitStoreI32(tablePtr, entryOffset, typeIdx, entryTypeOff);
             b.emitStoreI32(tablePtr, entryOffset, funcId, entryFuncIdOff);
             b.emitStoreI64(tablePtr, entryOffset, funcPtr, entryFuncPtrOff);
-            // The funcId is this module's, so this instance owns the entry
-            b.emitStoreI64(tablePtr, entryOffset, b.useVar(ctx.ctxPtrVar), entryOwnerOff);
+            int ownerId = b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.OWNER_ID);
+            b.emitStoreI64(tablePtr, entryOffset, ownerId, entryOwnerOff);
         }
         b.emitJump(mergeBlock);
 
         b.switchToBlock(mergeBlock);
+    }
+
+    /** Has the runner register this instance with the table before its first native write. */
+    private static void emitRegisterTableWriter(EmitContext ctx, int tableIdx) {
+        var b = ctx.bridge.exports();
+        int zero = b.emitIconst32(0);
+        int writersPtr = b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.TABLE_WRITERS_PTR);
+        int registered = b.emitLoadI32(writersPtr, zero, tableIdx * 4);
+        int isNew = b.emitIcmp(0, registered, zero); // EQ
+        int registerBlock = b.createBlock();
+        int afterBlock = b.createBlock();
+        b.emitBrif(isNew, registerBlock, afterBlock);
+
+        b.switchToBlock(registerBlock);
+        int argsPtr = b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.ARGS_PTR);
+        b.emitStoreI64(
+                argsPtr, zero, b.emitUextendI64(b.emitIconst32(tableIdx)), CtxBuffer.argOffset(0));
+        b.emitStoreI32(
+                b.useVar(ctx.ctxPtrVar),
+                zero,
+                b.emitIconst32(-6), // sentinel for table writer
+                CtxBuffer.ARG_COUNT);
+        int trampolinePtr = b.emitLoadI64(b.useVar(ctx.ctxPtrVar), zero, CtxBuffer.TRAMPOLINE_PTR);
+        b.pushCallArg(b.useVar(ctx.ctxPtrVar));
+        b.emitCallIndirect(ctx.getOrCreateTrampolineSigRef(), trampolinePtr);
+        emitTrapCheck(ctx);
+        b.emitJump(afterBlock);
+
+        b.switchToBlock(afterBlock);
     }
 
     static void emitTableSize(EmitContext ctx, AnnotatedInstruction ins) {

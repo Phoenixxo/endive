@@ -16,8 +16,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.api.internal.CtxBuffer;
 import run.endive.redline.experimental.api.internal.InterruptWatchdog;
@@ -88,12 +87,8 @@ public final class JffiNativeMachine implements Machine {
         MEMSET_ADDR = memset;
     }
 
-    /**
-     * Open machines by context address. A table entry names its owner by
-     * context, so this is how a foreign entry, or
-     * {@link JffiNativeTable#instance}, finds the owning machine.
-     */
-    private static final Map<Long, JffiNativeMachine> BY_CONTEXT = new ConcurrentHashMap<>();
+    // Never reused, unlike a context address, so a stale entry cannot match a new instance
+    private static final AtomicLong OWNER_IDS = new AtomicLong();
 
     private final Instance instance;
     private final Function[] entryTrampolines; // entry trampoline per func
@@ -107,7 +102,9 @@ public final class JffiNativeMachine implements Machine {
     private final long globalsBufferAddr;
     private final long funcTypesArrayAddr;
     private final long funcTypesArraySize; // byte size
+    private final long ownerId = OWNER_IDS.incrementAndGet();
     private long tablePtrsArrayAddr;
+    private long tableWritersAddr;
     private JffiNativeTable[] nativeTables;
     private boolean[] ownsTable;
     private boolean tablesInitialized;
@@ -213,6 +210,7 @@ public final class JffiNativeMachine implements Machine {
         MEM.putLong(ctxBufferAddr + CtxBuffer.FUNC_TYPES_PTR, funcTypesArrayAddr);
         MEM.putLong(ctxBufferAddr + CtxBuffer.MEMMOVE_PTR, MEMMOVE_ADDR);
         MEM.putLong(ctxBufferAddr + CtxBuffer.MEMSET_PTR, MEMSET_ADDR);
+        MEM.putLong(ctxBufferAddr + CtxBuffer.OWNER_ID, ownerId);
 
         byte[] image = code.image();
 
@@ -278,27 +276,15 @@ public final class JffiNativeMachine implements Machine {
         // An imported memory outlives this instance and may back others, so only
         // a memory this module defines is ours to close.
         this.ownsMemory = instance.imports().memoryCount() == 0;
-        BY_CONTEXT.put(ctxBufferAddr, this);
     }
 
-    /**
-     * Returns the open machine whose context is at {@code address}.
-     *
-     * @param address a context address, as recorded in a table entry
-     * @return the machine, or {@code null} if none is open there
-     */
-    static JffiNativeMachine forContext(long address) {
-        return BY_CONTEXT.get(address);
+    /** Returns the id that the table entries this machine owns hold. */
+    long ownerId() {
+        return ownerId;
     }
 
-    /**
-     * Returns the address of this machine's context, which the table entries it
-     * writes record as their owner.
-     *
-     * @return the context address
-     */
-    long contextAddress() {
-        return ctxBufferAddr;
+    boolean isClosed() {
+        return closed;
     }
 
     /** Returns the instance this machine executes. */
@@ -314,7 +300,6 @@ public final class JffiNativeMachine implements Machine {
             return;
         }
         closed = true;
-        BY_CONTEXT.remove(ctxBufferAddr, this);
         if (ownsTable != null) {
             for (int i = 0; i < ownsTable.length; i++) {
                 if (ownsTable[i]) {
@@ -327,6 +312,7 @@ public final class JffiNativeMachine implements Machine {
         }
         if (tablePtrsArrayAddr != 0) {
             MEM.freeMemory(tablePtrsArrayAddr);
+            MEM.freeMemory(tableWritersAddr);
         }
         trampolineHandle.dispose();
         memGrowHandle.dispose();
@@ -534,11 +520,11 @@ public final class JffiNativeMachine implements Machine {
 
     /**
      * Calls a table entry this instance does not own, in the instance that
-     * does. Compiled code has already checked the index and that the entry is
-     * not null. The entry's type index is the owner's, so the signature is
-     * checked here by structure. The call runs through the owner's machine,
-     * against the owner's memory, globals and tables. A trap there becomes an
-     * exception that unwinds this instance too.
+     * does. Compiled code has already checked the index. The entry's type
+     * index is the owner's, so the signature is checked here by structure. The
+     * call runs through the owner's machine, against the owner's memory,
+     * globals and tables. A trap there becomes an exception that unwinds this
+     * instance too.
      *
      * @param typeId the expected type, in this module's index space
      * @param tableIdx the table, in this module's index space
@@ -550,13 +536,17 @@ public final class JffiNativeMachine implements Machine {
     private long callForeignEntry(int typeId, int tableIdx, int elemIdx, int argCount) {
         JffiNativeTable table = nativeTables[tableIdx];
         int funcId = table.ref(elemIdx);
-        Instance owner = table.instance(elemIdx);
-        if (owner == null || owner.getMachine() == null) {
+        if (funcId == Value.REF_NULL_VALUE) {
             throw new TrapException("uninitialized element");
         }
-        var expected = (FunctionType) instance.module().typeSection().getType(typeId);
+        // An entry written with no owner runs in the caller, as in the interpreter
+        Instance owner = table.instance(elemIdx);
+        if (owner == null) {
+            owner = instance;
+        }
+        var expected = instance.type(typeId);
         var actual = owner.type(owner.functionType(funcId));
-        if (!expected.equals(actual)) {
+        if (!FunctionType.matches(actual, expected, instance.module().typeSection())) {
             throw new TrapException("indirect call type mismatch");
         }
         long[] args = new long[argCount];
@@ -580,12 +570,8 @@ public final class JffiNativeMachine implements Machine {
                     int oldSize = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(0));
                     int newSize = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(1));
                     int fillValue = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(2));
-                    long tableAddr = MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(3));
                     int tblIdx = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(4));
-                    boolean externRef = nativeTables[tblIdx].isExternRef();
-                    for (int i = oldSize; i < newSize; i++) {
-                        writeTableEntry(tableAddr, i, fillValue, externRef);
-                    }
+                    nativeTables[tblIdx].fill(oldSize, newSize, fillValue, instance);
                     nativeTables[tblIdx].limits().grow(newSize - oldSize);
                     break;
                 }
@@ -594,12 +580,8 @@ public final class JffiNativeMachine implements Machine {
                     int offset = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(0));
                     int end = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(1));
                     int fillValue = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(2));
-                    long tableAddr = MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(3));
                     int tblIdx = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(4));
-                    boolean externRef = nativeTables[tblIdx].isExternRef();
-                    for (int i = offset; i < end; i++) {
-                        writeTableEntry(tableAddr, i, fillValue, externRef);
-                    }
+                    nativeTables[tblIdx].fill(offset, end, fillValue, instance);
                     break;
                 }
             case -3:
@@ -609,20 +591,7 @@ public final class JffiNativeMachine implements Machine {
                     int srcOff = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(2));
                     int dstOff = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(3));
                     int size = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(4));
-                    if (dstOff <= srcOff) {
-                        for (int i = 0; i < size; i++) {
-                            copyTableEntry(srcAddr, srcOff + i, dstAddr, dstOff + i);
-                        }
-                    } else {
-                        for (int i = size - 1; i >= 0; i--) {
-                            copyTableEntry(srcAddr, srcOff + i, dstAddr, dstOff + i);
-                        }
-                    }
-                    JffiNativeTable src = tableAt(srcAddr);
-                    JffiNativeTable dst = tableAt(dstAddr);
-                    if (src != null && dst != null) {
-                        dst.copyOwnersFrom(src, srcOff, dstOff, size);
-                    }
+                    tableAt(dstAddr).copyFrom(tableAt(srcAddr), srcOff, dstOff, size);
                     break;
                 }
             case -4:
@@ -640,6 +609,13 @@ public final class JffiNativeMachine implements Machine {
                 { // elem drop
                     int elemIdx = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(0));
                     instance.setElement(elemIdx, null);
+                    break;
+                }
+            case -6:
+                { // first native table.set into a table
+                    int tblIdx = (int) MEM.getLong(argsBufferAddr + CtxBuffer.argOffset(0));
+                    nativeTables[tblIdx].registerWriter(this);
+                    MEM.putInt(tableWritersAddr + (long) tblIdx * 4, 1);
                     break;
                 }
             case -8:
@@ -686,36 +662,11 @@ public final class JffiNativeMachine implements Machine {
         return 0L;
     }
 
-    private void writeTableEntry(long tableAddr, int index, int funcId, boolean isExternRef) {
-        long base =
-                tableAddr
-                        + CtxBuffer.TABLE_ENTRIES_OFFSET
-                        + (long) index * CtxBuffer.TABLE_ENTRY_SIZE;
-        if (funcId == Value.REF_NULL_VALUE) {
-            MEM.putInt(base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, 0);
-            MEM.putInt(base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, Value.REF_NULL_VALUE);
-            MEM.putLong(base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, 0L);
-        } else if (isExternRef) {
-            MEM.putInt(base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, 0);
-            MEM.putInt(base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, funcId);
-            MEM.putLong(base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, 0L);
-        } else {
-            long funcPtr = MEM.getLong(funcTableAddr + (long) funcId * 8);
-            int typeIdx = MEM.getInt(funcTypesArrayAddr + (long) funcId * 4);
-            MEM.putInt(base + CtxBuffer.ENTRY_TYPE_IDX_OFFSET, typeIdx);
-            MEM.putInt(base + CtxBuffer.ENTRY_FUNC_ID_OFFSET, funcId);
-            MEM.putLong(base + CtxBuffer.ENTRY_FUNC_PTR_OFFSET, funcPtr);
-            MEM.putLong(base + CtxBuffer.ENTRY_OWNER_CTX_OFFSET, ctxBufferAddr);
-            return;
-        }
-        MEM.putLong(base + CtxBuffer.ENTRY_OWNER_CTX_OFFSET, 0L);
-    }
-
     /**
      * Finds this instance's table whose native buffer is at {@code address}.
      *
      * @param address a table buffer address
-     * @return the table, or {@code null} if this instance has none there
+     * @return the table
      */
     private JffiNativeTable tableAt(long address) {
         for (JffiNativeTable table : nativeTables) {
@@ -723,19 +674,7 @@ public final class JffiNativeMachine implements Machine {
                 return table;
             }
         }
-        return null;
-    }
-
-    private static void copyTableEntry(long srcAddr, int srcIdx, long dstAddr, int dstIdx) {
-        long srcBase =
-                srcAddr
-                        + CtxBuffer.TABLE_ENTRIES_OFFSET
-                        + (long) srcIdx * CtxBuffer.TABLE_ENTRY_SIZE;
-        long dstBase =
-                dstAddr
-                        + CtxBuffer.TABLE_ENTRIES_OFFSET
-                        + (long) dstIdx * CtxBuffer.TABLE_ENTRY_SIZE;
-        MEM.copyMemory(srcBase, dstBase, CtxBuffer.TABLE_ENTRY_SIZE);
+        throw new WasmEngineException("no table at " + address);
     }
 
     // --- Memory grow upcall stub ---
@@ -841,6 +780,7 @@ public final class JffiNativeMachine implements Machine {
         boolean[] owned = new boolean[tableCount];
         this.ownsTable = owned;
         this.tablePtrsArrayAddr = MEM.allocateMemory((long) tableCount * 8, true);
+        this.tableWritersAddr = MEM.allocateMemory((long) tableCount * 4, true);
 
         for (int i = 0; i < tableCount; i++) {
             var table = instance.table(i);
@@ -859,6 +799,7 @@ public final class JffiNativeMachine implements Machine {
         }
 
         MEM.putLong(ctxBufferAddr + CtxBuffer.TABLE_PTRS, tablePtrsArrayAddr);
+        MEM.putLong(ctxBufferAddr + CtxBuffer.TABLE_WRITERS_PTR, tableWritersAddr);
     }
 
     /** Package-private: used by JffiNativeTable to resolve funcId → funcPtr. */
@@ -1003,6 +944,10 @@ public final class JffiNativeMachine implements Machine {
 
     @Override
     public long[] call(int funcId, long[] args) throws WasmEngineException {
+        if (closed) {
+            // Its native code and buffers are gone, but a table may still hold its functions
+            throw new WasmEngineException("instance is closed");
+        }
         if (funcId < numImports) {
             // Host import — delegate directly
             var imprt = instance.imports().function(funcId);
@@ -1011,6 +956,9 @@ public final class JffiNativeMachine implements Machine {
 
         var funcType = funcTypes[funcId];
         long funcAddr = MEM.getLong(funcTableAddr + (long) funcId * 8);
+        if (entryTrampolines[funcId] == null) {
+            throw new WasmEngineException("Function " + funcId + " not compiled");
+        }
 
         try {
             boolean outermostCall = callDepth++ == 0;

@@ -146,6 +146,13 @@ public class Instance implements AutoCloseable {
                 for (int j = 0; j < tbl.size(); j++) {
                     tbl.setObjRef(j, result.ref(), this);
                 }
+            } else if (initValue != Value.REF_NULL_VALUE) {
+                // Record the owner, or a table importer would call it as its own function
+                var tbl = this.tables[i];
+                var owner = computeConstantInstance(this, tables[i].initialize());
+                for (int j = 0; j < tbl.size(); j++) {
+                    tbl.setRef(j, initValue, owner);
+                }
             }
         }
 

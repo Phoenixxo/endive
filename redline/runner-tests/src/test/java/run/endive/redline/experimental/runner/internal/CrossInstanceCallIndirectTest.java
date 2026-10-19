@@ -1,18 +1,21 @@
 package run.endive.redline.experimental.runner.internal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import run.endive.redline.experimental.api.NativeCode;
 import run.endive.redline.experimental.api.internal.RedlineTarget;
 import run.endive.redline.experimental.compiler.internal.NativeCompiler;
 import run.endive.redline.experimental.runner.NativeMachineFactory;
 import run.endive.runtime.HostFunction;
 import run.endive.runtime.Instance;
 import run.endive.runtime.Store;
+import run.endive.testing.NativeInstanceBuilder;
 import run.endive.tools.wasm.Wat2Wasm;
 import run.endive.wasm.Parser;
 import run.endive.wasm.WasmEngineException;
@@ -79,6 +82,41 @@ public class CrossInstanceCallIndirectTest {
                 i32.sub)
               (func (export "wrongType") (result i64)
                 (call_indirect (type $i64) (i32.const 0))))
+            """;
+
+    /** Defines an empty table and calls through it. */
+    private static final String HOLDER =
+            """
+            (module
+              (type $i32 (func (result i32)))
+              (table (export "tab") 2 4 funcref)
+              (func (export "call") (param i32) (result i32)
+                (call_indirect (type $i32) (local.get 0))))
+            """;
+
+    /** Puts its function, which returns 42, in the holder's table. */
+    private static final String WRITER =
+            """
+            (module
+              (import "holder" "tab" (table 2 funcref))
+              (global $g i32 (i32.const 42))
+              (func $answer (result i32) global.get $g)
+              (elem (i32.const 0) $answer))
+            """;
+
+    /**
+     * Calls through the holder's table. Its own function has the same index as
+     * the writer's but returns -1.
+     */
+    private static final String READER =
+            """
+            (module
+              (type $i32 (func (result i32)))
+              (import "holder" "tab" (table 2 funcref))
+              (global $g i32 (i32.const -1))
+              (func $own (result i32) global.get $g)
+              (func (export "call") (param i32) (result i32)
+                (call_indirect (type $i32) (local.get 0))))
             """;
 
     @Test
@@ -148,10 +186,49 @@ public class CrossInstanceCallIndirectTest {
         }
     }
 
+    /** As in the interpreter, a function whose declared type is a subtype matches. */
+    @Test
+    public void signatureAcceptsADeclaredSubtype() {
+        var store = new Store();
+        try (var owner =
+                nativeInstance(
+                        """
+                        (module
+                          (type $super (sub (func (result funcref))))
+                          (type $sub (sub $super (func (result (ref func)))))
+                          (table (export "tab") 1 funcref)
+                          (func $f (type $sub) (ref.func $f))
+                          (elem (i32.const 0) $f))
+                        """,
+                        store)) {
+            store.register("owner", owner);
+            try (var caller =
+                    nativeInstance(
+                            """
+                            (module
+                              (type $super (sub (func (result funcref))))
+                              (import "owner" "tab" (table 1 funcref))
+                              (func (export "call") (result i32)
+                                (ref.is_null (call_indirect (type $super) (i32.const 0)))))
+                            """,
+                            store)) {
+                assertEquals(0, (int) caller.export("call").apply()[0]);
+            }
+        }
+    }
+
     @Test
     public void tableReportsTheOwnerOfEachEntry() {
         try (var linked = linkNative()) {
             assertSame(linked.owner, linked.owner.table(0).instance(0));
+        }
+    }
+
+    @Test
+    public void nullEntryTraps() {
+        try (var holder = nativeInstance(HOLDER, new Store())) {
+            var e = assertThrows(WasmEngineException.class, () -> call(holder, "call", 0));
+            assertTrue(e.getMessage().contains("uninitialized element"), e.getMessage());
         }
     }
 
@@ -163,37 +240,263 @@ public class CrossInstanceCallIndirectTest {
     public void entriesFromAnInterpretedInstance() {
         var store = new Store();
         try (var tableOwner =
-                nativeBuilder(
-                                parse(
-                                        """
-                                        (module
-                                          (type $i32 (func (result i32)))
-                                          (table (export "tab") 2 funcref)
-                                          (global $g i32 (i32.const -1))
-                                          (func $own (result i32) global.get $g)
-                                          (elem (i32.const 1) $own)
-                                          (func (export "call") (param i32) (result i32)
-                                            (call_indirect (type $i32) (local.get 0))))
-                                        """))
-                        .build()) {
+                nativeInstance(
+                        """
+                        (module
+                          (type $i32 (func (result i32)))
+                          (table (export "tab") 2 funcref)
+                          (global $g i32 (i32.const -1))
+                          (func $own (result i32) global.get $g)
+                          (elem (i32.const 1) $own)
+                          (func (export "call") (param i32) (result i32)
+                            (call_indirect (type $i32) (local.get 0))))
+                        """,
+                        store)) {
             store.register("owner", tableOwner);
             try (var filler =
-                    Instance.builder(
-                                    parse(
-                                            """
-                                            (module
-                                              (import "owner" "tab" (table 2 funcref))
-                                              (global $g i32 (i32.const 42))
-                                              (func $answer (result i32) global.get $g)
-                                              (elem (i32.const 0) $answer))
-                                            """))
-                            .withImportValues(store.toImportValues())
-                            .build()) {
+                    interpretedInstance(
+                            """
+                            (module
+                              (import "owner" "tab" (table 2 funcref))
+                              (global $g i32 (i32.const 42))
+                              (func $answer (result i32) global.get $g)
+                              (elem (i32.const 0) $answer))
+                            """,
+                            store)) {
                 assertEquals(42, call(tableOwner, "call", 0), "the interpreted filler's function");
                 assertEquals(-1, call(tableOwner, "call", 1), "the table owner's own function");
                 assertSame(filler, tableOwner.table(0).instance(0));
             }
         }
+    }
+
+    /** The interpreter learns the native owner of an entry from the table. */
+    @Test
+    public void interpretedCallerRunsTheNativeOwner() {
+        var store = storeWithHost();
+        try (var owner = nativeInstance(OWNER, store)) {
+            store.register("owner", owner);
+            try (var caller = interpretedInstance(CALLER, store)) {
+                assertEquals(42, call(caller, "call", 0));
+                assertEquals(1000, call(caller, "call", 1));
+                assertEquals(7, call(caller, "call", 2));
+            }
+        }
+    }
+
+    /** No one calls the defining instance, so only the table says it owns the entries. */
+    @Test
+    public void tableInitialiserBelongsToItsDefiningInstance() {
+        var store = new Store();
+        try (var definer =
+                nativeInstance(
+                        """
+                        (module
+                          (global $g i32 (i32.const 42))
+                          (func $answer (result i32) global.get $g)
+                          (table (export "tab") 2 funcref (ref.func $answer)))
+                        """,
+                        store)) {
+            store.register("holder", definer);
+            try (var reader = nativeInstance(READER, store)) {
+                assertEquals(42, call(reader, "call", 1), "the definer's function");
+                assertSame(definer, definer.table(0).instance(1));
+            }
+        }
+    }
+
+    /** Entries copied out of an imported table still run in their owner. */
+    @Test
+    public void copiedEntriesKeepTheirNativeOwner() {
+        var store = storeWithHost();
+        try (var owner = nativeInstance(OWNER, store)) {
+            store.register("owner", owner);
+            try (var copier =
+                    nativeInstance(
+                            """
+                            (module
+                              (type $i32 (func (result i32)))
+                              (import "owner" "tab" (table $imported 6 funcref))
+                              (table $own 6 funcref)
+                              (func (export "copy")
+                                (table.copy $own $imported
+                                  (i32.const 0) (i32.const 0) (i32.const 6)))
+                              (func (export "call") (param i32) (result i32)
+                                (call_indirect $own (type $i32) (local.get 0))))
+                            """,
+                            store)) {
+                copier.export("copy").apply();
+                assertEquals(42, call(copier, "call", 0));
+                assertEquals(1000, call(copier, "call", 1));
+                assertSame(owner, copier.table(1).instance(0));
+            }
+        }
+    }
+
+    /** Copies within and across tables keep the owners an interpreted instance wrote. */
+    @Test
+    public void copiedEntriesKeepTheirInterpretedOwner() {
+        var store = new Store();
+        try (var tableOwner =
+                nativeInstance(
+                        """
+                        (module
+                          (type $i32 (func (result i32)))
+                          (table $a (export "a") 4 funcref)
+                          (table $b 4 funcref)
+                          (func (export "copyAToB")
+                            (table.copy $b $a (i32.const 0) (i32.const 0) (i32.const 4)))
+                          (func (export "shiftA")
+                            (table.copy $a $a (i32.const 1) (i32.const 0) (i32.const 3)))
+                          (func (export "callA") (param i32) (result i32)
+                            (call_indirect $a (type $i32) (local.get 0)))
+                          (func (export "callB") (param i32) (result i32)
+                            (call_indirect $b (type $i32) (local.get 0))))
+                        """,
+                        store)) {
+            store.register("owner", tableOwner);
+            try (var filler =
+                    interpretedInstance(
+                            """
+                            (module
+                              (import "owner" "a" (table 4 funcref))
+                              (global $g i32 (i32.const 42))
+                              (func $answer (result i32) global.get $g)
+                              (elem (i32.const 0) $answer))
+                            """,
+                            store)) {
+                tableOwner.export("copyAToB").apply();
+                assertEquals(42, call(tableOwner, "callB", 0));
+                assertSame(filler, tableOwner.table(1).instance(0));
+
+                tableOwner.export("shiftA").apply();
+                assertEquals(42, call(tableOwner, "callA", 0));
+                assertEquals(42, call(tableOwner, "callA", 1));
+                assertSame(filler, tableOwner.table(0).instance(1));
+                assertNull(tableOwner.table(0).instance(2), "shifted in from a null entry");
+            }
+        }
+    }
+
+    @Test
+    public void hostWritesRecordTheOwner() {
+        var store = storeWithHost();
+        try (var owner = nativeInstance(OWNER, store);
+                var holder = nativeInstance(HOLDER, store)) {
+            var table = holder.table(0);
+            table.setRef(0, 1, owner); // $readGlobal
+            assertEquals(42, call(holder, "call", 0));
+            assertEquals(2, table.grow(1, 2, owner)); // $readMemory
+            assertEquals(1000, call(holder, "call", 2));
+            assertSame(owner, table.instance(2));
+        }
+    }
+
+    /** table.set, table.grow and table.fill run natively in the instance writing the entry. */
+    @Test
+    public void nativeWritesByAnotherInstance() {
+        var store = new Store();
+        try (var holder = nativeInstance(HOLDER, store)) {
+            store.register("holder", holder);
+            try (var setter =
+                    nativeInstance(
+                            """
+                            (module
+                              (import "holder" "tab" (table 2 funcref))
+                              (global $g i32 (i32.const 42))
+                              (func $answer (result i32) global.get $g)
+                              (elem declare func $answer)
+                              (func (export "set") (param i32)
+                                (table.set (local.get 0) (ref.func $answer)))
+                              (func (export "grow") (result i32)
+                                (table.grow (ref.func $answer) (i32.const 1)))
+                              (func (export "fill")
+                                (table.fill (i32.const 0) (ref.func $answer) (i32.const 2))))
+                            """,
+                            store)) {
+                setter.export("set").apply(0);
+                assertEquals(42, call(holder, "call", 0));
+                assertSame(setter, holder.table(0).instance(0));
+
+                assertEquals(2, (int) setter.export("grow").apply()[0]);
+                assertEquals(42, call(holder, "call", 2));
+
+                setter.export("fill").apply();
+                assertEquals(42, call(holder, "call", 1));
+            }
+        }
+    }
+
+    /** A new instance may get a closed owner's context address, and must not take its entries. */
+    @Test
+    public void closedOwnerTrapsInsteadOfRunningAnotherInstance() {
+        var store = new Store();
+        try (var holder = nativeInstance(HOLDER, store)) {
+            store.register("holder", holder);
+            var writer = nativeInstance(WRITER, store);
+            assertEquals(42, call(holder, "call", 0));
+            writer.close();
+
+            try (var reader = nativeInstance(READER, store);
+                    var interpretedReader = interpretedInstance(READER, store)) {
+                assertSame(writer, holder.table(0).instance(0));
+                assertClosed(() -> call(reader, "call", 0));
+                assertClosed(() -> call(holder, "call", 0));
+                assertClosed(() -> call(interpretedReader, "call", 0));
+            }
+        }
+    }
+
+    /** The table drops closed instances that none of its entries refer to. */
+    @Test
+    public void tableReleasesClosedWriters() {
+        var store = new Store();
+        try (var holder = nativeInstance(HOLDER, store)) {
+            store.register("holder", holder);
+            for (int i = 0; i < 50; i++) {
+                nativeInstance(WRITER, store).close();
+            }
+            var table = (NativeTable) holder.table(0);
+            assertTrue(table.writerCount() <= 8, table.writerCount() + " writers kept");
+            assertClosed(() -> call(holder, "call", 0));
+        }
+    }
+
+    /** An image may leave functions out, which a table must not jump to. */
+    @Test
+    public void uncompiledFunctionIsNotCalled() {
+        var module =
+                parse(
+                        """
+                        (module
+                          (type $i32 (func (result i32)))
+                          (table 2 funcref)
+                          (func $uncompiled (result i32) (i32.const 7))
+                          (elem (i32.const 0) $uncompiled)
+                          (func (export "callElem") (result i32)
+                            (call_indirect (type $i32) (i32.const 0)))
+                          (func (export "setAndCall") (result i32)
+                            (table.set (i32.const 1) (ref.func $uncompiled))
+                            (call_indirect (type $i32) (i32.const 1))))
+                        """);
+        try (var instance =
+                NativeMachineFactory.builder(module)
+                        .withPrecompiledCode(withoutFirstBody(compile(module)))
+                        .build()) {
+            var e =
+                    assertThrows(
+                            WasmEngineException.class, () -> instance.export("callElem").apply());
+            assertTrue(e.getMessage().contains("not compiled"), e.getMessage());
+            e =
+                    assertThrows(
+                            WasmEngineException.class, () -> instance.export("setAndCall").apply());
+            assertTrue(e.getMessage().contains("uninitialized element"), e.getMessage());
+        }
+    }
+
+    private static void assertClosed(Runnable call) {
+        var e = assertThrows(WasmEngineException.class, call::run);
+        assertTrue(e.getMessage().contains("instance is closed"), e.getMessage());
     }
 
     /** The owner and caller instances, closed caller first. */
@@ -212,17 +515,22 @@ public class CrossInstanceCallIndirectTest {
      * @return the linked instances, to close after the test
      */
     private static Linked linkNative() {
+        var store = storeWithHost();
+        var owner = nativeInstance(OWNER, store);
+        store.register("owner", owner);
+        var caller = nativeInstance(CALLER, store);
+        return new Linked(owner, caller);
+    }
+
+    /** A store with the owner's host import, which returns 7. */
+    private static Store storeWithHost() {
         var seven =
                 new HostFunction(
                         "host",
                         "seven",
                         FunctionType.of(List.of(), List.of(ValType.I32)),
                         (inst, args) -> new long[] {7});
-        var store = new Store().addFunction(seven);
-        var owner = nativeBuilder(parse(OWNER)).withImportValues(store.toImportValues()).build();
-        store.register("owner", owner);
-        var caller = nativeBuilder(parse(CALLER)).withImportValues(store.toImportValues()).build();
-        return new Linked(owner, caller);
+        return new Store().addFunction(seven);
     }
 
     /**
@@ -237,17 +545,38 @@ public class CrossInstanceCallIndirectTest {
         return (int) instance.export(export).apply(index)[0];
     }
 
-    /**
-     * Starts a native instance of {@code module}, compiled for this host.
-     *
-     * @param module the module to instantiate
-     * @return a builder with the module's native code
-     */
-    private static NativeMachineFactory.Builder nativeBuilder(WasmModule module) {
-        return NativeMachineFactory.builder(module)
-                .withPrecompiledCode(
-                        NativeCompiler.compile(
-                                RedlineTarget.detectHost().orElseThrow().triple(), module));
+    /** Instantiates {@code wat} natively against the store's exports. */
+    private static Instance nativeInstance(String wat, Store store) {
+        return NativeInstanceBuilder.builder(parse(wat))
+                .withImportValues(store.toImportValues())
+                .build();
+    }
+
+    /** Instantiates {@code wat} in the interpreter against the store's exports. */
+    private static Instance interpretedInstance(String wat, Store store) {
+        return Instance.builder(parse(wat)).withImportValues(store.toImportValues()).build();
+    }
+
+    private static NativeCode compile(WasmModule module) {
+        return NativeCompiler.compile(RedlineTarget.detectHost().orElseThrow().triple(), module);
+    }
+
+    /** Returns {@code code} with its first function body left uncompiled. */
+    private static NativeCode withoutFirstBody(NativeCode code) {
+        int[] bodies = new int[code.functionBodyCount()];
+        int[] entries = new int[code.functionBodyCount()];
+        for (int i = 0; i < bodies.length; i++) {
+            bodies[i] = i == 0 ? NativeCode.NOT_COMPILED : code.bodyOffset(i);
+            entries[i] = i == 0 ? NativeCode.NOT_COMPILED : code.entryTrampolineOffset(i);
+        }
+        int[] importTrampolines = new int[code.importCount()];
+        int[] importSlots = new int[code.importCount()];
+        for (int i = 0; i < importTrampolines.length; i++) {
+            importTrampolines[i] = code.importTrampolineOffset(i);
+            importSlots[i] = code.importStubSlotOffset(i);
+        }
+        return new NativeCode(
+                code.triple(), code.image(), bodies, entries, importTrampolines, importSlots);
     }
 
     /** Parses a module from WebAssembly text format. */

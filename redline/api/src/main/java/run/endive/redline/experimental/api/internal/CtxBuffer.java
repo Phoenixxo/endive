@@ -20,6 +20,8 @@ package run.endive.redline.experimental.api.internal;
  *  64     i64    memsetPtr         Pointer to libc memset
  *  72     i64    interruptFlag     Non-zero = interrupt requested
  *  80     i64    memoryPagesPtr    Shared memory: pointer to its current page count (i32)
+ *  88     i64    ownerId           Unique id of this instance, held by the entries it owns
+ *  96     i64    tableWritersPtr   Pointer to an i32 per table, set once it keeps this instance
  * 200     i64    globalsPtr        Pointer to globals buffer
  * 208     i64    memGrowPtr        Upcall stub for memory.grow
  * 216     i32    memoryPages       Current memory page count
@@ -54,6 +56,8 @@ public final class CtxBuffer {
     public static final int MEMSET_PTR = 64;
     public static final int INTERRUPT_FLAG = 72;
     public static final int MEMORY_PAGES_PTR = 80;
+    public static final int OWNER_ID = 88;
+    public static final int TABLE_WRITERS_PTR = 96;
 
     public static final int GLOBALS_PTR = 200;
     public static final int MEM_GROW_PTR = 208;
@@ -91,11 +95,8 @@ public final class CtxBuffer {
     public static final int ENTRY_FUNC_ID_OFFSET = 4;
     public static final int ENTRY_FUNC_PTR_OFFSET = 8;
 
-    /**
-     * The context of the instance that defines the entry's function or 0 when
-     * that instance has no native context.
-     */
-    public static final int ENTRY_OWNER_CTX_OFFSET = 16;
+    // Owner id of the native instance defining the function, or 0 if there is none
+    public static final int ENTRY_OWNER_ID_OFFSET = 16;
 
     public static int argOffset(int i) {
         return 8 * i;

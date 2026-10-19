@@ -30,7 +30,7 @@ import java.nio.ByteBuffer;
 public final class NativeCodeSerializer {
 
     private static final int MAGIC = 0x434C344A; // "CL4J"
-    private static final int VERSION = 3;
+    private static final int VERSION = 4;
 
     private NativeCodeSerializer() {}
 

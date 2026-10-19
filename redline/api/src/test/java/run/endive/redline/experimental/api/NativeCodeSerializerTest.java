@@ -54,15 +54,18 @@ public class NativeCodeSerializerTest {
     }
 
     @Test
-    public void aVersionOneFileIsRejected() throws IOException {
-        var out = new ByteArrayOutputStream();
-        var dos = new DataOutputStream(out);
-        dos.writeInt(0x434C344A);
-        dos.writeInt(1);
-        dos.writeInt(0);
+    public void anOlderVersionIsRejected() throws IOException {
+        // Version 3 code reads 16-byte table entries
+        for (int version = 1; version <= 3; version++) {
+            var out = new ByteArrayOutputStream();
+            var dos = new DataOutputStream(out);
+            dos.writeInt(0x434C344A);
+            dos.writeInt(version);
+            dos.writeInt(0);
 
-        var e = assertThrows(IOException.class, () -> deserialize(out.toByteArray()));
-        assertTrue(e.getMessage().contains("version"), e.getMessage());
+            var e = assertThrows(IOException.class, () -> deserialize(out.toByteArray()));
+            assertTrue(e.getMessage().contains("version"), e.getMessage());
+        }
     }
 
     @Test

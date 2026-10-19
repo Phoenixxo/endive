@@ -390,6 +390,30 @@ public final class MachinesTest {
         assertEquals(42, instance.export("call-other").apply()[0]);
     }
 
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("crossModuleMachineFactories")
+    public void shouldCallTableInitialiserInItsDefiningInstance(
+            String name,
+            Function<Instance, Machine> callerFactory,
+            Function<Instance, Machine> definerFactory) {
+        var store = new Store();
+
+        var definer =
+                Instance.builder(loadModule("compiled/table_init_owner-export.wat.wasm"))
+                        .withMachineFactory(definerFactory)
+                        .build();
+        store.register("test", definer);
+
+        var caller =
+                Instance.builder(loadModule("compiled/table_init_owner-import.wat.wasm"))
+                        .withImportValues(store.toImportValues())
+                        .withMachineFactory(callerFactory)
+                        .build();
+
+        assertEquals(42, caller.export("call").apply(1)[0]);
+        assertEquals(definer, definer.table(0).instance(1));
+    }
+
     @Test
     public void tailcallReturnCallAot() {
         var instance =
