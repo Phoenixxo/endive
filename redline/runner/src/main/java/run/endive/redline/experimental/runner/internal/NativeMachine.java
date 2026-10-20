@@ -593,7 +593,13 @@ public final class NativeMachine implements Machine {
         for (int i = 0; i < argCount; i++) {
             args[i] = argsBuffer.get(ValueLayout.JAVA_LONG, CtxBuffer.argOffset(i));
         }
-        long[] results = owner.getMachine().call(funcId, args);
+        // One stack budget for the whole chain, or each instance would add its own
+        long stackLimit = ctxBuffer.get(ValueLayout.JAVA_LONG, CtxBuffer.STACK_LIMIT);
+        long[] results =
+                owner.getMachine() instanceof NativeMachine ownerMachine
+                        ? ownerMachine.callWithStackLimit(funcId, args, stackLimit)
+                        : owner.getMachine().call(funcId, args);
+        refreshMemoryPages();
         if (expected.returns().size() > 1) {
             for (int i = 0; i < results.length; i++) {
                 argsBuffer.set(ValueLayout.JAVA_LONG, CtxBuffer.argOffset(i), results[i]);
@@ -926,6 +932,11 @@ public final class NativeMachine implements Machine {
 
     @Override
     public long[] call(int funcId, long[] args) throws WasmEngineException {
+        return callWithStackLimit(funcId, args, 0L);
+    }
+
+    /** Calls with the stack limit an outermost call starts from, 0 to anchor a new one. */
+    private long[] callWithStackLimit(int funcId, long[] args, long stackLimit) {
         if (closed) {
             // Its native code and buffers are gone, but a table may still hold its functions
             throw new WasmEngineException("instance is closed");
@@ -953,7 +964,7 @@ public final class NativeMachine implements Machine {
             // against where the outer call began, or every level moves the
             // limit deeper and the guard stops firing.
             if (outermostCall) {
-                ctxBuffer.set(ValueLayout.JAVA_LONG, CtxBuffer.STACK_LIMIT, 0L);
+                ctxBuffer.set(ValueLayout.JAVA_LONG, CtxBuffer.STACK_LIMIT, stackLimit);
             }
 
             if (!memBaseInitialized) {

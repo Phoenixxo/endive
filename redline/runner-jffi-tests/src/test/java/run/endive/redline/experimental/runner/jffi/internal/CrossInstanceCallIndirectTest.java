@@ -165,6 +165,76 @@ public class CrossInstanceCallIndirectTest {
         }
     }
 
+    /** Compiled code caches the page count, so the caller must see a growth in the callee. */
+    @Test
+    public void callerSeesMemoryTheCalleeGrew() {
+        var store = new Store();
+        try (var owner =
+                nativeInstance(
+                        "(module\n"
+                                + "  (memory (export \"mem\") 1)\n"
+                                + "  (table (export \"tab\") 1 funcref)\n"
+                                + "  (func $grow (result i32) (memory.grow (i32.const 1)))\n"
+                                + "  (elem (i32.const 0) $grow))\n",
+                        store)) {
+            store.register("owner", owner);
+            try (var caller =
+                    nativeInstance(
+                            "(module\n"
+                                    + "  (type $i32 (func (result i32)))\n"
+                                    + "  (import \"owner\" \"mem\" (memory 1))\n"
+                                    + "  (import \"owner\" \"tab\" (table 1 funcref))\n"
+                                    + "  (func (export \"growThenStore\") (result i32)\n"
+                                    + "    (drop (call_indirect (type $i32) (i32.const 0)))\n"
+                                    + "    (i32.store (i32.const 65536) (memory.size))\n"
+                                    + "    (i32.load (i32.const 65536))))\n",
+                            store)) {
+                assertEquals(2, (int) caller.export("growThenStore").apply()[0]);
+            }
+        }
+    }
+
+    /**
+     * The callee gets what is left of the caller's stack budget, not a new one,
+     * or a chain of instances could outgrow the thread's stack.
+     */
+    @Test
+    public void calleeSharesTheCallersStackBudget() {
+        var store = new Store();
+        try (var owner =
+                nativeInstance(
+                        "(module\n"
+                                + "  (global (export \"depth\") (mut i32) (i32.const 0))\n"
+                                + "  (table (export \"tab\") 1 funcref)\n"
+                                + "  (func $recurse (result i32)\n"
+                                + "    (global.set 0 (i32.add (global.get 0) (i32.const 1)))\n"
+                                + "    (call $recurse))\n"
+                                + "  (elem (i32.const 0) $recurse))\n",
+                        store)) {
+            store.register("owner", owner);
+            try (var caller =
+                    nativeInstance(
+                            "(module\n"
+                                + "  (type $i32 (func (result i32)))\n"
+                                + "  (import \"owner\" \"tab\" (table 1 funcref))\n"
+                                + "  (global (export \"depth\") (mut i32) (i32.const 0))\n"
+                                + "  (func $descend (export \"descend\") (param i32) (result i32)\n"
+                                + "    (global.set 0 (i32.add (global.get 0) (i32.const 1)))\n"
+                                + "    (if (result i32) (local.get 0)\n"
+                                + "      (then\n"
+                                + "        (call $descend (i32.sub (local.get 0) (i32.const 1))))\n"
+                                + "      (else (call_indirect (type $i32) (i32.const 0))))))\n",
+                            store)) {
+                int callerBudget = depthReached(caller, -1, caller);
+                int fromTheTop = depthReached(caller, 0, owner);
+                int fromHalfway = depthReached(caller, callerBudget / 2, owner);
+                assertTrue(
+                        fromHalfway < fromTheTop * 3 / 4,
+                        fromHalfway + " levels from halfway, " + fromTheTop + " from the top");
+            }
+        }
+    }
+
     @Test
     public void signatureIsCheckedByStructure() {
         try (var linked = linkNative()) {
@@ -464,6 +534,20 @@ public class CrossInstanceCallIndirectTest {
                             WasmEngineException.class, () -> instance.export("setAndCall").apply());
             assertTrue(e.getMessage().contains("uninitialized element"), e.getMessage());
         }
+    }
+
+    /**
+     * Has the caller descend {@code levels} before calling the owner, until
+     * the stack runs out.
+     *
+     * @return how many levels {@code counted} recursed
+     */
+    private static int depthReached(Instance caller, int levels, Instance counted) {
+        var depth = counted.exports().global("depth");
+        int before = (int) depth.getValue();
+        var e = assertThrows(WasmEngineException.class, () -> call(caller, "descend", levels));
+        assertTrue(e.getMessage().contains("call stack exhausted"), e.getMessage());
+        return (int) depth.getValue() - before;
     }
 
     private static void assertClosed(Runnable call) {
